@@ -1,0 +1,7 @@
+timestamp=2026-02-10T02:54:30Z
+resolved_root=docker-image:nvcr.io/nvidia/isaac-sim:5.1.0:/isaac-sim
+preflight_start
+[ISAAC_ENV_RESOLVED] root=docker-image:nvcr.io/nvidia/isaac-sim:5.1.0:/isaac-sim
+[ISAAC_ENV_OK] root=docker-image:nvcr.io/nvidia/isaac-sim:5.1.0:/isaac-sim msg=OMNI_OK
+ISAAC_ENV_CHECK_OK
+preflight_end

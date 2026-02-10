@@ -1,0 +1,14 @@
+cd /home/peng/DualVLN
+
+# v22 Isaac env discovery / wrapper preflight
+bash scripts/isaac/find_isaac_root.sh
+bash scripts/isaac/run_with_isaac_python.sh -- -c "print('V22_WRAPPER_OK')"
+
+# v22 Isaac suite (real isaac, no fallback)
+TOPO_DEBUG_CAPTURE=1 TOPO_DEBUG_ONLY_ON_FAIL=1 TOPO_V22_RUN_LIMIT=1 bash scripts/topo_eval_suite_v22_isaac.sh
+
+# optional local UI serve
+python3 -m http.server 8000 --directory runs/topo_mvp/v22_isaac/debug_runs
+
+# package proof
+bash scripts/package_topo_mvp_proof_v22_isaac.sh
