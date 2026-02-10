@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Envs
+.env
+*.env
+.env.*
+
+# Secrets
+*secret*
+*token*
+*credential*
+
+# Local data/output
+runs/
+checkpoints/
+forGPT/**/topo_mvp_PROOF_*.zip
+forGPT/**/*.zip
+*.zip
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# Repo internals
+**/.git/
+
+# Logs
+*.log
+
+# Caches
+.cache/
+.tmp/
+
+# OS
+.DS_Store

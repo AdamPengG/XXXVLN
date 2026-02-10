@@ -1,0 +1,23 @@
+global:
+  dt_action: 0.5
+  max_steps: 120
+  node_reach_thresh: 0.8
+  queries:
+    - "kitchen table"
+    - "bedroom"
+    - "bathroom sink"
+    - "living room sofa"
+    - "front door"
+  start_offsets:
+    - 8
+    - 18
+    - 28
+    - 38
+    - 48
+
+scenes:
+  - scene_id: "8WUmhLawc2A"
+    usd_path: "data/isaac_scenes/8WUmhLawc2A.usd"
+  - scene_id: "ur6pFq6Qu1A"
+    usd_path: "data/isaac_scenes/ur6pFq6Qu1A.usd"
+

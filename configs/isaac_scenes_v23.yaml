@@ -1,0 +1,26 @@
+global:
+  dt_action: 0.5
+  max_steps: 120
+  node_reach_thresh: 0.8
+  queries:
+    - "front door"
+    - "table"
+    - "corridor"
+  start_offsets:
+    - 0
+    - 1
+    - 2
+
+scenes:
+  - scene_id: "isaac_office_min"
+    usd_path: ""
+    bounds: [-6.0, 6.0, -6.0, 6.0]
+    oracle_grid_step: 0.25
+    starts:
+      - {x: -2.8, y: 0.0, z: -2.5, yaw_deg: 25}
+      - {x: 2.2, y: 0.0, z: -1.8, yaw_deg: 145}
+      - {x: 0.0, y: 0.0, z: 2.8, yaw_deg: -110}
+    obstacles:
+      - {x: 0.0, z: 1.5, r: 0.6}
+      - {x: -1.5, z: -1.0, r: 0.5}
+      - {x: 2.0, z: -0.5, r: 0.7}
