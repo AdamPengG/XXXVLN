@@ -7,6 +7,13 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from internnav.sim_backend.isaac_camera_config_v29 import (
+    IsaacCameraConfig,
+    apply_camera_config,
+    build_camera_config,
+    depth_stats,
+    rgb_fidelity_stats,
+)
 from internnav.sim_backend.base import Obs, Pose, SimBackend
 from internnav.topo.local_planner import plan_grid_path
 
@@ -59,10 +66,15 @@ class IsaacSimBackend(SimBackend):
         self._renderer_requested = str(os.environ.get("ISAAC_RENDERER", "rtx")).strip().lower() or "rtx"
         self._renderer_fallback = "storm" if self._renderer_requested == "rtx" else "rtx"
         self._renderer_used = "unknown"
+        self._enable_depth = bool(int(os.environ.get("ISAAC_ENABLE_DEPTH", "0")))
         self._rgb_capture = bool(int(os.environ.get("ISAAC_RGB_CAPTURE", "0")))
         self._skip_world_step = bool(int(os.environ.get("ISAAC_SKIP_WORLD_STEP", "0")))
         self._render = bool(int(os.environ.get("ISAAC_RENDER", "0")))
         self._minimal = bool(int(os.environ.get("ISAAC_MINIMAL", "0")))
+        self._camera_cfg: IsaacCameraConfig = build_camera_config(self.scene_cfg)
+        self._camera_cfg_info: Dict[str, object] = {}
+        self._camera_fidelity_info: Dict[str, object] = {}
+        self._camera_probe_done = False
         # v26: RGB capture forces world init + render
         if self._rgb_capture:
             self._minimal = False
@@ -275,8 +287,8 @@ class IsaacSimBackend(SimBackend):
         try:
             from omni.isaac.sensor import Camera  # type: ignore
 
-            w = int(self.scene_cfg.get("cam_w", 320))
-            h = int(self.scene_cfg.get("cam_h", 240))
+            w = int(self._camera_cfg.width)
+            h = int(self._camera_cfg.height)
             self._camera = Camera(
                 prim_path="/World/TopoCamera",
                 frequency=20,
@@ -293,8 +305,38 @@ class IsaacSimBackend(SimBackend):
                 self._camera.add_distance_to_image_plane_to_frame()
             except Exception:
                 pass
+            self._camera_cfg_info = apply_camera_config(self._camera, self._camera_cfg)
+            if len(self._camera_cfg_info) > 0:
+                print(
+                    f"[ISAAC_CAMERA_CFG] w={int(self._camera_cfg_info.get('camera_w', w))} "
+                    f"h={int(self._camera_cfg_info.get('camera_h', h))} "
+                    f"fov_deg={float(self._camera_cfg_info.get('camera_fov_deg', self._camera_cfg.fov_deg)):.2f} "
+                    f"near={float(self._camera_cfg_info.get('camera_near', self._camera_cfg.near_m)):.4f} "
+                    f"far={float(self._camera_cfg_info.get('camera_far', self._camera_cfg.far_m)):.2f} "
+                    f"auto_exposure={int(self._camera_cfg_info.get('auto_exposure', self._camera_cfg.auto_exposure))} "
+                    f"exposure={float(self._camera_cfg_info.get('exposure', self._camera_cfg.exposure)):.4f} "
+                    f"aspect={self._camera_cfg_info.get('aspect_policy', self._camera_cfg.aspect_policy)}",
+                    flush=True,
+                )
         except Exception:
             self._camera = None
+            self._camera_cfg_info = {
+                "camera_w": int(self._camera_cfg.width),
+                "camera_h": int(self._camera_cfg.height),
+                "camera_fov_deg": float(self._camera_cfg.fov_deg),
+                "camera_near": float(self._camera_cfg.near_m),
+                "camera_far": float(self._camera_cfg.far_m),
+                "auto_exposure": int(self._camera_cfg.auto_exposure),
+                "exposure": float(self._camera_cfg.exposure),
+                "aspect_policy": str(self._camera_cfg.aspect_policy),
+            }
+            print(
+                f"[ISAAC_CAMERA_CFG] w={self._camera_cfg.width} h={self._camera_cfg.height} "
+                f"fov_deg={self._camera_cfg.fov_deg:.2f} near={self._camera_cfg.near_m:.4f} "
+                f"far={self._camera_cfg.far_m:.2f} auto_exposure={self._camera_cfg.auto_exposure} "
+                f"exposure={self._camera_cfg.exposure:.4f} aspect={self._camera_cfg.aspect_policy}",
+                flush=True,
+            )
 
         self._world.reset()
         if not self._skip_world_step:
@@ -473,8 +515,8 @@ class IsaacSimBackend(SimBackend):
         return float("inf")
 
     def _synthetic_rgbd(self) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        h = int(self.scene_cfg.get("cam_h", 240))
-        w = int(self.scene_cfg.get("cam_w", 320))
+        h = int(self._camera_cfg.height)
+        w = int(self._camera_cfg.width)
         yy, xx = np.mgrid[0:h, 0:w]
         x01 = xx.astype(np.float32) / max(1.0, float(w - 1))
         y01 = yy.astype(np.float32) / max(1.0, float(h - 1))
@@ -487,6 +529,16 @@ class IsaacSimBackend(SimBackend):
         rgb = np.stack([r, g, b], axis=-1)
         rgb = (255.0 * rgb).astype(np.uint8)
         return rgb, None
+
+    def _apply_camera_tonemap(self, rgb: np.ndarray) -> np.ndarray:
+        arr = np.asarray(rgb, dtype=np.uint8)
+        if int(self._camera_cfg.auto_exposure) != 0:
+            return arr
+        exp_scale = float(max(1e-4, self._camera_cfg.exposure))
+        if abs(exp_scale - 1.0) <= 1e-4:
+            return arr
+        out = np.clip(arr.astype(np.float32) * exp_scale, 0.0, 255.0).astype(np.uint8)
+        return out
 
     def _read_camera_rgbd(self) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         if self._camera is None:
@@ -522,6 +574,10 @@ class IsaacSimBackend(SimBackend):
                     depth = depth[..., 0]
         except Exception:
             depth = None
+        if not self._enable_depth:
+            depth = None
+        if rgb is not None:
+            rgb = self._apply_camera_tonemap(rgb)
         if rgb is not None and self._rgb_capture:
             _var = float(np.var(rgb.astype(np.float32)))
             _mean = float(np.mean(rgb.astype(np.float32)))
@@ -560,8 +616,98 @@ class IsaacSimBackend(SimBackend):
             info=dict(info or {}),
         )
         obs.info["renderer_used"] = str(self._renderer_used)
+        if len(self._camera_cfg_info) > 0:
+            obs.info["camera"] = dict(self._camera_cfg_info)
+        if len(self._camera_fidelity_info) > 0:
+            obs.info["camera_fidelity"] = dict(self._camera_fidelity_info)
         self._last_obs = obs
         return obs
+
+    def run_camera_fidelity_probe(self, frames: int = 10) -> Dict[str, object]:
+        num = max(3, int(frames))
+        if self._camera is None:
+            out = {
+                "ok": 0,
+                "frames": 0,
+                "placeholder_ratio": 1.0,
+                "mean_luma": 0.0,
+                "luma_std": 0.0,
+                "mean_frame_delta": 0.0,
+                "reason": "camera_none",
+            }
+            self._camera_fidelity_info = dict(out)
+            print("[ISAAC_CAMERA_FIDELITY] ok=0 reason=camera_none hint=check_camera_init", flush=True)
+            return out
+
+        orig_xyz = np.array(self._pose_xyz, dtype=np.float32)
+        orig_yaw = float(self._yaw)
+        rgbs: List[np.ndarray] = []
+        depths: List[np.ndarray] = []
+        for i in range(num):
+            yaw_off = (float(i) - 0.5 * float(num - 1)) * 0.01
+            self._set_pose(orig_xyz, _wrap_pi(orig_yaw + yaw_off))
+            if self._world is not None:
+                self._world.step(render=True)
+            rgb, depth = self._read_camera_rgbd()
+            rgbs.append(np.asarray(rgb, dtype=np.uint8))
+            if self._enable_depth and depth is not None:
+                depths.append(np.asarray(depth, dtype=np.float32))
+        self._set_pose(orig_xyz, orig_yaw)
+        if self._world is not None:
+            self._world.step(render=True)
+
+        stats = rgb_fidelity_stats(rgbs)
+        ok = (
+            float(stats["placeholder_ratio"]) < 0.95
+            and float(stats["mean_luma"]) > 2.0
+            and float(stats["mean_luma"]) < 252.0
+            and float(stats["mean_frame_delta"]) > 0.0
+        )
+        out = {
+            "ok": int(bool(ok)),
+            "frames": int(num),
+            "placeholder_ratio": float(stats["placeholder_ratio"]),
+            "mean_luma": float(stats["mean_luma"]),
+            "luma_std": float(stats["luma_std"]),
+            "mean_frame_delta": float(stats["mean_frame_delta"]),
+        }
+        self._camera_fidelity_info = dict(out)
+        if bool(ok):
+            print(
+                f"[ISAAC_CAMERA_FIDELITY] ok=1 frames={num} "
+                f"placeholder_ratio={float(stats['placeholder_ratio']):.3f} "
+                f"mean_luma={float(stats['mean_luma']):.3f} "
+                f"luma_std={float(stats['luma_std']):.3f} "
+                f"mean_frame_delta={float(stats['mean_frame_delta']):.3f}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[ISAAC_CAMERA_FIDELITY] ok=0 reason=degenerate_stream "
+                f"frames={num} placeholder_ratio={float(stats['placeholder_ratio']):.3f} "
+                f"mean_luma={float(stats['mean_luma']):.3f} "
+                f"luma_std={float(stats['luma_std']):.3f} "
+                f"mean_frame_delta={float(stats['mean_frame_delta']):.3f} "
+                f"hint=check_renderer_or_camera_cfg",
+                flush=True,
+            )
+        if self._enable_depth:
+            dst = depth_stats(depths)
+            out["depth"] = dict(dst)
+            print(
+                f"[ISAAC_DEPTH] ok={int(dst.get('ok', 0.0) > 0.5)} frames={len(depths)} "
+                f"min={float(dst.get('min', 0.0)):.4f} max={float(dst.get('max', 0.0)):.4f} "
+                f"invalid_ratio={float(dst.get('invalid_ratio', 1.0)):.4f}",
+                flush=True,
+            )
+        return out
+
+    def get_camera_info(self) -> Dict[str, object]:
+        out: Dict[str, object] = dict(self._camera_cfg_info)
+        if len(self._camera_fidelity_info) > 0:
+            out["fidelity"] = dict(self._camera_fidelity_info)
+        out["renderer_used"] = str(self._renderer_used)
+        return out
 
     def reset(self, scene_id: str, start_spec: Dict[str, object]) -> Obs:
         if self._fallback is not None:
@@ -592,6 +738,9 @@ class IsaacSimBackend(SimBackend):
             z = rad * math.sin(ang)
             self._set_pose(np.array([x, 0.0, z], dtype=np.float32), -ang)
 
+        if not self._camera_probe_done and bool(int(os.environ.get("ISAAC_CAMERA_PROBE_ON_RESET", "1"))):
+            self.run_camera_fidelity_probe(frames=int(os.environ.get("ISAAC_CAMERA_PROBE_FRAMES", "10")))
+            self._camera_probe_done = True
         self._last_collision = False
         return self._build_obs(
             info={
