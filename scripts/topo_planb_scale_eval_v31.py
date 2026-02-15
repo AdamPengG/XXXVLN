@@ -258,26 +258,36 @@ def _parse_v33a_log(log_path: Path) -> Dict[str, int]:
     return out
 
 
-def _parse_v33b_log(log_path: Path) -> Dict[str, int]:
-    out = {"blocked": 0, "overrides": 0, "doorway": 0, "caps_depth0": 0}
+def _parse_v33b_log(log_path: Path) -> Dict[str, Any]:
+    out = {
+        "blocked": 0,
+        "overrides": 0,
+        "blocked_no_override": 0,
+        "doorway": 0,
+        "caps_depth0": 0,
+    }
+    reason_counts: Dict[str, int] = {}
     if not log_path.exists():
         return out
     for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
         if "[V33B_LOCAL_AVOID]" in line:
             if "blocked=1" in line:
                 out["blocked"] += 1
-            if "action_in=" in line and "action_out=" in line:
+            if "override=1" in line:
+                out["overrides"] += 1
+            elif "blocked=1" in line and "override=0" in line:
+                out["blocked_no_override"] += 1
+                reason = "unknown"
                 try:
-                    ain = line.split("action_in=", 1)[1].split()[0].strip()
-                    aout = line.split("action_out=", 1)[1].split()[0].strip()
-                    if ain != aout:
-                        out["overrides"] += 1
+                    reason = line.split("reason=", 1)[1].split()[0].strip()
                 except Exception:
-                    pass
+                    reason = "unknown"
+                reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
         if "[V33B_DOORWAY]" in line and "trigger=1" in line:
             out["doorway"] += 1
         if "[V33B_CAPS]" in line and "depth=0" in line:
             out["caps_depth0"] += 1
+    out["blocked_no_override_reasons"] = reason_counts
     return out
 
 
@@ -743,6 +753,33 @@ def main() -> int:
             placeholder_ratio = None
             if isinstance(camera.get("fidelity", {}), dict):
                 placeholder_ratio = float(camera.get("fidelity", {}).get("placeholder_ratio", 0.0))
+            result_v33b = result.get("v33b", {}) if isinstance(result, dict) and isinstance(result.get("v33b", {}), dict) else {}
+            blocked_count = int(
+                result_v33b.get(
+                    "blocked_detected_count",
+                    result_v33b.get("blocked_count", v33b_stats.get("blocked", 0)),
+                )
+                or 0
+            )
+            override_count = int(result_v33b.get("override_count", v33b_stats.get("overrides", 0)) or 0)
+            blocked_no_override_count = int(
+                result_v33b.get("blocked_no_override_count", v33b_stats.get("blocked_no_override", 0)) or 0
+            )
+            blocked_no_override_reasons = result_v33b.get(
+                "blocked_no_override_reasons",
+                v33b_stats.get("blocked_no_override_reasons", {}),
+            )
+            if not isinstance(blocked_no_override_reasons, dict):
+                blocked_no_override_reasons = {}
+            doorway_trigger_count = int(result_v33b.get("doorway_triggers", v33b_stats.get("doorway", 0)) or 0)
+            blocked_forward_count = int(result_v33b.get("blocked_forward_count", blocked_count) or 0)
+            blocked_forward_overridden = int(result_v33b.get("blocked_forward_overridden_count", override_count) or 0)
+            blocked_forward_pass_through = int(
+                result_v33b.get("blocked_forward_pass_through_count", blocked_no_override_count) or 0
+            )
+            blocked_forward_reasons = result_v33b.get("blocked_forward_reasons", blocked_no_override_reasons)
+            if not isinstance(blocked_forward_reasons, dict):
+                blocked_forward_reasons = {}
 
             if goal_type == "room":
                 room_ok, room_metrics = is_room_success_from_trace(trace_rows, g)
@@ -828,9 +865,19 @@ def main() -> int:
                 "v33a_stuck_triggers": int(v33a_stats.get("stuck_triggers", 0)),
                 "v33a_recovery_count": int(v33a_stats.get("recoveries", 0)),
                 "v33a_recovery_giveup": int(v33a_stats.get("giveup", 0)),
-                "v33b_blocked_count": int(v33b_stats.get("blocked", 0)),
-                "v33b_override_count": int(v33b_stats.get("overrides", 0)),
-                "v33b_doorway_trigger_count": int(v33b_stats.get("doorway", 0)),
+                "v33b_blocked_count": blocked_count,
+                "v33b_override_count": override_count,
+                "v33b_blocked_no_override_count": blocked_no_override_count,
+                "v33b_blocked_no_override_reasons": {
+                    str(k): int(v) for k, v in sorted(blocked_no_override_reasons.items())
+                },
+                "v33b_blocked_forward_count": blocked_forward_count,
+                "v33b_blocked_forward_overridden_count": blocked_forward_overridden,
+                "v33b_blocked_forward_pass_through_count": blocked_forward_pass_through,
+                "v33b_blocked_forward_reasons": {
+                    str(k): int(v) for k, v in sorted(blocked_forward_reasons.items())
+                },
+                "v33b_doorway_trigger_count": doorway_trigger_count,
                 "v33b_caps_depth0": int(v33b_stats.get("caps_depth0", 0)),
             }
             records.append(rec)
@@ -873,8 +920,36 @@ def main() -> int:
     stuck_failures = int(sum(1 for r in records if str(r.get("fail_type", "")) == "stuck"))
     v33b_blocked_total = int(sum(int(r.get("v33b_blocked_count", 0) or 0) for r in records))
     v33b_override_total = int(sum(int(r.get("v33b_override_count", 0) or 0) for r in records))
+    v33b_blocked_no_override_total = int(sum(int(r.get("v33b_blocked_no_override_count", 0) or 0) for r in records))
+    v33b_blocked_forward_total = int(sum(int(r.get("v33b_blocked_forward_count", 0) or 0) for r in records))
+    v33b_blocked_forward_overridden_total = int(
+        sum(int(r.get("v33b_blocked_forward_overridden_count", 0) or 0) for r in records)
+    )
+    v33b_blocked_forward_pass_total = int(
+        sum(int(r.get("v33b_blocked_forward_pass_through_count", 0) or 0) for r in records)
+    )
     v33b_doorway_total = int(sum(int(r.get("v33b_doorway_trigger_count", 0) or 0) for r in records))
     v33b_depth_missing = int(sum(int(r.get("v33b_caps_depth0", 0) or 0) for r in records))
+    v33b_no_override_reasons = Counter()
+    for r in records:
+        reasons = r.get("v33b_blocked_no_override_reasons", {})
+        if not isinstance(reasons, dict):
+            continue
+        for k, v in reasons.items():
+            try:
+                v33b_no_override_reasons[str(k)] += int(v)
+            except Exception:
+                continue
+    v33b_forward_reasons = Counter()
+    for r in records:
+        reasons = r.get("v33b_blocked_forward_reasons", {})
+        if not isinstance(reasons, dict):
+            continue
+        for k, v in reasons.items():
+            try:
+                v33b_forward_reasons[str(k)] += int(v)
+            except Exception:
+                continue
 
     summary = {
         "version": int(goal_catalog_version),
@@ -898,6 +973,12 @@ def main() -> int:
         "v33b": {
             "blocked_total": v33b_blocked_total,
             "overrides_total": v33b_override_total,
+            "blocked_no_override_total": v33b_blocked_no_override_total,
+            "blocked_no_override_reasons": dict(sorted(v33b_no_override_reasons.items())),
+            "blocked_forward_total": v33b_blocked_forward_total,
+            "blocked_forward_overridden_total": v33b_blocked_forward_overridden_total,
+            "blocked_forward_pass_through_total": v33b_blocked_forward_pass_total,
+            "blocked_forward_reasons": dict(sorted(v33b_forward_reasons.items())),
             "doorway_triggers_total": v33b_doorway_total,
             "depth_caps_missing_runs": v33b_depth_missing,
         },
@@ -931,6 +1012,12 @@ def main() -> int:
     )
     v33b_anchor = (
         f"[V33B_SUMMARY] blocked={v33b_blocked_total} overrides={v33b_override_total} "
+        f"blocked_no_override={v33b_blocked_no_override_total} "
+        f"blocked_no_override_reasons=\"{','.join(f'{k}:{v}' for k, v in sorted(v33b_no_override_reasons.items()))}\" "
+        f"blocked_forward={v33b_blocked_forward_total} "
+        f"blocked_forward_overridden={v33b_blocked_forward_overridden_total} "
+        f"blocked_forward_pass_through={v33b_blocked_forward_pass_total} "
+        f"blocked_forward_reasons=\"{','.join(f'{k}:{v}' for k, v in sorted(v33b_forward_reasons.items()))}\" "
         f"doorway_triggers={v33b_doorway_total} depth_caps_missing_runs={v33b_depth_missing}"
     )
     print(v33a_anchor, flush=True)

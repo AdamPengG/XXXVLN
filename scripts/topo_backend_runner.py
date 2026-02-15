@@ -517,17 +517,28 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
     v33b_depth_source = ""
     v33b_depth_caps_logged = False
     v33b_depth_stats_logged = False
-    v33b_blocked_count = 0
+    v33b_blocked_detected_count = 0
     v33b_override_count = 0
+    v33b_blocked_no_override_count = 0
+    v33b_blocked_no_override_reasons: collections.Counter[str] = collections.Counter()
+    v33b_blocked_forward_count = 0
+    v33b_blocked_forward_overridden_count = 0
+    v33b_blocked_forward_pass_through_count = 0
+    v33b_blocked_forward_reasons: collections.Counter[str] = collections.Counter()
     v33b_doorway_triggers = 0
-    v33b_doorway_side = 0
-    v33b_doorway_hyst = 0
     v33b_offsets = _parse_offsets_deg(args.v33b_offsets_deg)
     v33b_fov_deg = float(camera_info.get("camera_fov_deg", 90.0)) if isinstance(camera_info, dict) else 90.0
     v33b_near = float(camera_info.get("camera_near", 0.05)) if isinstance(camera_info, dict) else 0.05
     v33b_far = float(camera_info.get("camera_far", 50.0)) if isinstance(camera_info, dict) else 50.0
     v33b_steer_latch_side = 0
     v33b_steer_latch_steps = 0
+    v33b_depth_prev_roi: Optional[np.ndarray] = None
+    v33b_depth_stale_delta_streak = 0
+    v33b_depth_same_stats_k = 0
+    v33b_depth_prev_blocked_stats: Optional[Tuple[float, float, float]] = None
+    v33b_depth_unreliable = False
+    v33b_collision_hist: Deque[int] = collections.deque(maxlen=6)
+    v33b_probe_failures = 0
     if v33b_enabled:
         print(
             f"[V33B_CFG] enable=1 require_depth={int(args.v33b_require_depth)} clearance_m={float(args.v33b_clearance_m):.2f} "
@@ -754,6 +765,7 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
 
             action = int(base_action)
             action_name = str(base_action_name)
+            v33b_forward_probe_applied = False
 
             # v33b: depth/costmap local avoidance as an action filter.
             if v33b_enabled and not v33b_depth_disabled:
@@ -831,9 +843,45 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                             else 1.0
                         )
                         is_forward_like = int(base_action) == 1
+                        blocked = False
+                        override = 0
+                        override_reason = "action_passthrough"
+                        chosen_off = float(best_off)
+                        chosen_clr = float(best_clr)
+                        depth_mean_delta = 0.0
+                        center_clear = bool(
+                            center_vr >= float(args.v33b_min_valid_ratio)
+                            and center_clr >= float(args.v33b_clearance_m) * 1.15
+                        )
+                        if occ_patch.size > 0:
+                            ds_h = max(1, int(occ_patch.shape[0] // 24))
+                            ds_w = max(1, int(occ_patch.shape[1] // 32))
+                            roi_small = occ_patch[::ds_h, ::ds_w]
+                            if (
+                                v33b_depth_prev_roi is not None
+                                and isinstance(v33b_depth_prev_roi, np.ndarray)
+                                and v33b_depth_prev_roi.shape == roi_small.shape
+                            ):
+                                pair_valid = np.isfinite(roi_small) & np.isfinite(v33b_depth_prev_roi)
+                                if pair_valid.any():
+                                    depth_mean_delta = float(
+                                        np.mean(np.abs(roi_small[pair_valid] - v33b_depth_prev_roi[pair_valid]))
+                                    )
+                                    if depth_mean_delta < 0.002:
+                                        v33b_depth_stale_delta_streak += 1
+                                    else:
+                                        v33b_depth_stale_delta_streak = 0
+                                else:
+                                    v33b_depth_stale_delta_streak = 0
+                            else:
+                                v33b_depth_stale_delta_streak = 0
+                            v33b_depth_prev_roi = roi_small.copy()
+
                         if not is_forward_like:
+                            override_reason = "action_not_forward"
                             print(
-                                f"[V33B_LOCAL_AVOID] step={step} skip=1 reason=action_not_forward action_in={base_action_name}",
+                                f"[V33B_LOCAL_AVOID] step={step} skip=1 blocked=0 override=0 "
+                                f"reason={override_reason} action_in={base_action_name} action_out={action_name}",
                                 flush=True,
                             )
                         else:
@@ -841,12 +889,21 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                                 (center_vr < float(args.v33b_min_valid_ratio))
                                 or (center_clr < float(args.v33b_clearance_m))
                             )
-                            center_clear = bool(
-                                center_vr >= float(args.v33b_min_valid_ratio)
-                                and center_clr >= float(args.v33b_clearance_m) * 1.15
-                            )
                             if blocked:
-                                v33b_blocked_count += 1
+                                v33b_blocked_detected_count += 1
+                                blocked_stats_sig = (
+                                    round(float(center_vr), 3),
+                                    round(float(center_clr), 3),
+                                    round(float(best_clr), 3),
+                                )
+                                if v33b_depth_prev_blocked_stats == blocked_stats_sig:
+                                    v33b_depth_same_stats_k += 1
+                                else:
+                                    v33b_depth_same_stats_k = 1
+                                v33b_depth_prev_blocked_stats = blocked_stats_sig
+                            else:
+                                v33b_depth_same_stats_k = 0
+                                v33b_depth_prev_blocked_stats = None
                             if step == 0 or blocked:
                                 print(
                                     f"[V33B_COSTMAP] ok=1 w={w} h={h} res={float(args.planner_grid_res):.3f} "
@@ -866,17 +923,37 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                                 )
                                 v33b_depth_stats_logged = True
 
+                            if (
+                                blocked
+                                and (v33b_depth_stale_delta_streak >= 10 or v33b_depth_same_stats_k >= 5)
+                                and not v33b_depth_unreliable
+                            ):
+                                v33b_depth_unreliable = True
+                                print(
+                                    f"[V33B_DEPTH_STALE] trigger=1 mean_delta={depth_mean_delta:.4f} "
+                                    f"same_stats_k={int(v33b_depth_same_stats_k)} action_in=FORWARD action_out=FORWARD",
+                                    flush=True,
+                                )
+
+                            collision_recent = bool(sum(v33b_collision_hist) > 0)
+                            can_force_turn = bool(collision_recent or (v33b_probe_failures > 0))
+                            if v33b_depth_unreliable:
+                                can_force_turn = False
+
+                            # If we are latched into a steering side, keep it while still blocked.
                             if v33b_steer_latch_steps > 0:
                                 if center_clear:
                                     v33b_steer_latch_steps = 0
                                     v33b_steer_latch_side = 0
                                     print("[V33B_STEER_LATCH] release=1", flush=True)
-                                else:
+                                elif blocked and can_force_turn:
                                     v33b_steer_latch_steps -= 1
                                     if int(v33b_steer_latch_side) != 0:
                                         action = 3 if int(v33b_steer_latch_side) > 0 else 2
                                         action_name = _action_id_to_name(action)
                                         recovery_event_labels.append("v33b_steer_latch")
+                                        override = 1
+                                        override_reason = "steer_latch"
 
                             if blocked and int(action) == int(base_action):
                                 improvement = float(best_clr - center_clr)
@@ -885,34 +962,88 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                                     abs(chosen_off) >= float(args.v33b_turn_step_deg)
                                     and improvement >= float(args.v33b_min_improve_m)
                                 )
-                                if bool(args.v33b_doorway_trigger) and should_turn:
-                                    chosen_side = 1 if chosen_off > 0.0 else -1
-                                    v33b_doorway_triggers += 1
-                                    print(
-                                        f"[V33B_DOORWAY] trigger=1 mode=sample_offsets best={float(best_off):.1f}",
-                                        flush=True,
-                                    )
-                                else:
+                                if can_force_turn:
                                     chosen_side = 1 if chosen_off > 0.0 else -1 if chosen_off < 0.0 else 0
-                                if should_turn and chosen_side != 0:
-                                    action = 3 if chosen_side > 0 else 2
-                                    action_name = _action_id_to_name(action)
-                                    recovery_event_labels.append("v33b_local_avoid")
-                                    v33b_steer_latch_side = int(chosen_side)
-                                    v33b_steer_latch_steps = max(1, int(args.v33b_steer_hyst_steps))
-                                    side_s = "right" if chosen_side > 0 else "left"
-                                    print(
-                                        f"[V33B_STEER_LATCH] set=1 side={side_s} steps={int(v33b_steer_latch_steps)}",
-                                        flush=True,
-                                    )
+                                    if chosen_side == 0:
+                                        # Deterministic fallback when best offset is straight-ahead.
+                                        left_opts = [o for o in v33b_offsets if float(o) < 0.0]
+                                        right_opts = [o for o in v33b_offsets if float(o) > 0.0]
+                                        left_clr = max(
+                                            (offset_metrics.get(float(o), (0.0, 0.0))[0] for o in left_opts),
+                                            default=0.0,
+                                        )
+                                        right_clr = max(
+                                            (offset_metrics.get(float(o), (0.0, 0.0))[0] for o in right_opts),
+                                            default=0.0,
+                                        )
+                                        if right_clr > left_clr:
+                                            chosen_side = 1
+                                            chosen_off = 10.0
+                                        elif left_clr > right_clr:
+                                            chosen_side = -1
+                                            chosen_off = -10.0
+                                    if chosen_side == 0:
+                                        chosen_side = 1 if int(v33b_steer_latch_side) >= 0 else -1
+                                        chosen_off = float(args.v33b_turn_step_deg) * float(chosen_side)
+                                    if bool(args.v33b_doorway_trigger) and should_turn and chosen_side != 0:
+                                        v33b_doorway_triggers += 1
+                                        print(
+                                            f"[V33B_DOORWAY] trigger=1 mode=sample_offsets best={float(best_off):.1f}",
+                                            flush=True,
+                                        )
+                                    if chosen_side != 0:
+                                        action = 3 if chosen_side > 0 else 2
+                                        action_name = _action_id_to_name(action)
+                                        recovery_event_labels.append("v33b_local_avoid")
+                                        v33b_steer_latch_side = int(chosen_side)
+                                        v33b_steer_latch_steps = max(1, int(args.v33b_steer_hyst_steps))
+                                        side_s = "right" if chosen_side > 0 else "left"
+                                        print(
+                                            f"[V33B_STEER_LATCH] set=1 side={side_s} steps={int(v33b_steer_latch_steps)}",
+                                            flush=True,
+                                        )
+                                        override = 1
+                                        override_reason = (
+                                            "blocked_turn_best_offset" if should_turn else "blocked_force_turn"
+                                        )
+                                    else:
+                                        override_reason = "blocked_no_valid_side"
+                                else:
+                                    if v33b_depth_unreliable:
+                                        override_reason = "blocked_depth_stale_pass_through"
+                                        print(
+                                            f"[V33B_DEPTH_STALE] trigger=1 mean_delta={depth_mean_delta:.4f} "
+                                            f"same_stats_k={int(v33b_depth_same_stats_k)} "
+                                            f"action_in=FORWARD action_out=FORWARD",
+                                            flush=True,
+                                        )
+                                    else:
+                                        override_reason = "blocked_no_collision_probe"
+                                        v33b_forward_probe_applied = True
 
                             if int(action) != int(base_action):
                                 v33b_override_count += 1
+                                override = 1
+                                if override_reason in {"action_passthrough", "action_not_forward"}:
+                                    override_reason = "action_changed"
+
+                            if blocked:
+                                v33b_blocked_forward_count += 1
+                                v33b_blocked_forward_reasons[str(override_reason)] += 1
+                                if override == 1:
+                                    v33b_blocked_forward_overridden_count += 1
+                                else:
+                                    v33b_blocked_forward_pass_through_count += 1
+                            if blocked and override == 0:
+                                if not override_reason:
+                                    override_reason = "blocked_no_override_unknown"
+                                v33b_blocked_no_override_count += 1
+                                v33b_blocked_no_override_reasons[str(override_reason)] += 1
 
                             print(
-                                f"[V33B_LOCAL_AVOID] step={step} blocked={int(blocked)} "
-                                f"chosen_offset={float(best_off):.1f} clearance={float(best_clr):.3f} "
-                                f"action_in={base_action_name} action_out={action_name}",
+                                f"[V33B_LOCAL_AVOID] step={step} blocked={int(blocked)} override={int(override)} "
+                                f"reason={override_reason} chosen_offset={float(chosen_off):.1f} "
+                                f"clearance={float(chosen_clr):.3f} action_in={base_action_name} action_out={action_name}",
                                 flush=True,
                             )
 
@@ -926,6 +1057,17 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             if args.controller_mode != "follower":
                 bearing_ctrl.update_after_step(int(action), moved)
             last_collision = obs_next.collision if obs_next.collision is not None else backend.get_collision_flag()
+            v33b_collision_hist.append(1 if bool(last_collision) else 0)
+            if v33b_forward_probe_applied:
+                new_goal_dist = float(np.linalg.norm(new_pos - goal_pos_now))
+                goal_progress = float(dist_goal - new_goal_dist)
+                if bool(last_collision) or goal_progress < 0.03:
+                    v33b_probe_failures += 1
+                else:
+                    v33b_probe_failures = 0
+            elif int(action) == 1 and moved > 0.05:
+                # Forward translation resets probe failure debt.
+                v33b_probe_failures = 0
 
             dist_trace.append(float(dist))
             goal_dist_trace.append(float(dist_goal))
@@ -1048,8 +1190,22 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             "depth_ready": int(v33b_depth_ready),
             "depth_disabled": int(v33b_depth_disabled),
             "depth_source": str(v33b_depth_source),
-            "blocked_count": int(v33b_blocked_count),
+            "blocked_detected_count": int(v33b_blocked_detected_count),
             "override_count": int(v33b_override_count),
+            "blocked_no_override_count": int(v33b_blocked_no_override_count),
+            "blocked_no_override_reasons": {
+                str(k): int(v) for k, v in sorted(v33b_blocked_no_override_reasons.items())
+            },
+            "blocked_forward_count": int(v33b_blocked_forward_count),
+            "blocked_forward_overridden_count": int(v33b_blocked_forward_overridden_count),
+            "blocked_forward_pass_through_count": int(v33b_blocked_forward_pass_through_count),
+            "blocked_forward_reasons": {
+                str(k): int(v) for k, v in sorted(v33b_blocked_forward_reasons.items())
+            },
+            "depth_unreliable": int(v33b_depth_unreliable),
+            "depth_stale_delta_streak": int(v33b_depth_stale_delta_streak),
+            "depth_same_stats_k": int(v33b_depth_same_stats_k),
+            "forward_probe_failures": int(v33b_probe_failures),
             "doorway_triggers": int(v33b_doorway_triggers),
         },
         "belief_entropy_summary": {
