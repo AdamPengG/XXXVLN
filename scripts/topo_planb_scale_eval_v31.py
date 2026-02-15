@@ -17,6 +17,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from planb.goal_resolver_v32 import (
+    capability_object_semantics,
+    is_pose_success,
+    is_room_success_from_trace,
+    normalize_catalog,
+    object_query_summary,
+    representative_pose_for_room,
+)
 
 
 def _load_yaml_or_json(path: Path) -> Dict[str, Any]:
@@ -180,36 +188,30 @@ def _build_start_scene_cfg(
 
 
 def _load_trace_stats(debug_run_dir: Path) -> Dict[str, Any]:
-    trace_path = debug_run_dir / "trace.jsonl"
-    if not trace_path.exists():
+    trace_rows = _load_trace_rows(debug_run_dir / "trace.jsonl")
+    if not trace_rows:
         return {
             "collision_count": 0,
             "stuck_count": 0,
             "steps": 0,
             "stationary_ratio": 0.0,
+            "last_pose": None,
         }
-    rows: List[Dict[str, Any]] = []
-    for line in trace_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except Exception:
-            continue
-    if not rows:
-        return {
-            "collision_count": 0,
-            "stuck_count": 0,
-            "steps": 0,
-            "stationary_ratio": 0.0,
-        }
+    rows = trace_rows
     collision_count = sum(int(r.get("collision", 0)) for r in rows)
     stuck_count = 0
     prev: Optional[Tuple[float, float]] = None
+    last_pose: Optional[Dict[str, float]] = None
     for r in rows:
         p = r.get("pose_used", {}) if isinstance(r.get("pose_used", {}), dict) else {}
         cur = (float(p.get("x", 0.0)), float(p.get("z", 0.0)))
+        last_pose = {
+            "x": float(p.get("x", 0.0)),
+            "y": float(p.get("y", 0.0)),
+            "z": float(p.get("z", 0.0)),
+            "yaw": float(p.get("yaw", 0.0)),
+            "yaw_deg": float(math.degrees(float(p.get("yaw", 0.0)))),
+        }
         if prev is not None:
             d = math.hypot(cur[0] - prev[0], cur[1] - prev[1])
             if d < 0.01:
@@ -221,7 +223,25 @@ def _load_trace_stats(debug_run_dir: Path) -> Dict[str, Any]:
         "stuck_count": int(stuck_count),
         "steps": int(len(rows)),
         "stationary_ratio": float(stationary_ratio),
+        "last_pose": last_pose,
     }
+
+
+def _load_trace_rows(trace_path: Path) -> List[Dict[str, Any]]:
+    if not trace_path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    for line in trace_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                rows.append(obj)
+        except Exception:
+            continue
+    return rows
 
 
 def _classify_fail(
@@ -265,7 +285,11 @@ def _write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         "start_id",
         "start_bucket",
         "goal_id",
+        "goal_type",
         "goal_bucket",
+        "compat_mode",
+        "room_id",
+        "object_query",
         "success",
         "fail_type",
         "reason",
@@ -300,6 +324,55 @@ def _write_index(path: Path, summary: Dict[str, Any], failure_cards_rel: str) ->
 """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(html, encoding="utf-8")
+
+
+def _anchor_tag_from_version(version: int) -> str:
+    return "V32_SCALE_EVAL" if int(version) >= 32 else "V31_SCALE_EVAL"
+
+
+def _as_pose_query_from_goal(goal: Dict[str, Any]) -> Tuple[Dict[str, Any], int, str, str]:
+    goal_type = str(goal.get("type", "pose")).strip().lower()
+    goal_value = goal.get("value", {}) if isinstance(goal.get("value", {}), dict) else {}
+    compat_mode = 0
+    room_id = ""
+    object_q = ""
+    if goal_type == "pose":
+        query = {
+            "type": "pose",
+            "value": {
+                "x": float(goal_value.get("x", 0.0)),
+                "y": float(goal_value.get("y", 0.0)),
+                "z": float(goal_value.get("z", 0.0)),
+                "yaw_deg": float(goal_value.get("yaw_deg", 0.0)),
+            },
+        }
+        return query, compat_mode, room_id, object_q
+
+    if goal_type == "room":
+        compat_mode = 1
+        room_id = str(goal_value.get("room_id", ""))
+        pose = representative_pose_for_room(goal)
+        query = {
+            "type": "pose",
+            "value": {
+                "x": float(pose.get("x", 0.0)),
+                "y": float(pose.get("y", 0.0)),
+                "z": float(pose.get("z", 0.0)),
+                "yaw_deg": float(pose.get("yaw_deg", 0.0)),
+            },
+        }
+        return query, compat_mode, room_id, object_q
+
+    if goal_type == "object":
+        compat_mode = 1
+        object_q = object_query_summary(goal)
+        query = {
+            "type": "text",
+            "value": object_q,
+        }
+        return query, compat_mode, room_id, object_q
+
+    raise ValueError(f"unsupported_goal_type:{goal_type}")
 
 
 def main() -> int:
@@ -358,39 +431,40 @@ def main() -> int:
             }
         )
 
-    catalog = _load_yaml_or_json(goal_catalog_path)
+    catalog_raw = _load_yaml_or_json(goal_catalog_path)
+    catalog = normalize_catalog(catalog_raw)
+    goal_catalog_version = int(catalog.get("version", cfg.get("version", 31)))
     goals_all = catalog.get("goals", []) if isinstance(catalog.get("goals"), list) else []
     goals: List[Dict[str, Any]] = []
     for g in goals_all:
         if not isinstance(g, dict):
             continue
-        if str(g.get("type", "pose")).lower() != "pose":
-            continue
         meta = g.get("meta", {}) if isinstance(g.get("meta", {}), dict) else {}
         bucket = str(meta.get("bucket", "unlabeled"))
         if include_buckets and bucket not in include_buckets:
             continue
-        val = g.get("value", {}) if isinstance(g.get("value", {}), dict) else {}
         goals.append(
             {
                 "id": _sanitize_id(str(g.get("id", f"goal_{len(goals)+1:03d}"))),
+                "type": str(g.get("type", "pose")).strip().lower(),
                 "bucket": bucket,
                 "aliases": list(meta.get("aliases", [])) if isinstance(meta.get("aliases", []), list) else [],
-                "value": {
-                    "x": float(val.get("x", 0.0)),
-                    "y": float(val.get("y", 0.0)),
-                    "z": float(val.get("z", 0.0)),
-                    "yaw_deg": float(val.get("yaw_deg", val.get("yaw", 0.0))),
-                },
+                "value": g.get("value", {}),
                 "success": g.get("success", {}),
+                "meta": meta,
             }
         )
         if len(goals) >= max_goals:
             break
 
+    anchor_tag = _anchor_tag_from_version(goal_catalog_version)
+    object_caps_ok, object_caps_reason = capability_object_semantics()
+    if goal_catalog_version >= 32:
+        print(f"[V32_CAPS] object_semantics={int(object_caps_ok)} reason={object_caps_reason}", flush=True)
+
     runs_total = len(starts) * len(goals)
     start_anchor = (
-        f"[V31_SCALE_EVAL] start scene={scene_id} starts={len(starts)} goals={len(goals)} "
+        f"[{anchor_tag}] start scene={scene_id} starts={len(starts)} goals={len(goals)} "
         f"runs_total={runs_total} out_root={out_root}"
     )
     print(start_anchor, flush=True)
@@ -423,18 +497,78 @@ def main() -> int:
 
         for gi, g in enumerate(goals):
             run_id = _sanitize_id(f"{scene_id}__{s['id']}__{g['id']}")
-            query = {
-                "type": "pose",
-                "value": {
-                    "x": float(g["value"]["x"]),
-                    "y": float(g["value"].get("y", 0.0)),
-                    "z": float(g["value"]["z"]),
-                    "yaw_deg": float(g["value"].get("yaw_deg", 0.0)),
-                },
-            }
+            goal_type = str(g.get("type", "pose")).strip().lower()
+            query, compat_mode, room_id, object_q = _as_pose_query_from_goal(g)
             query_json = json.dumps(query, ensure_ascii=False)
 
+            goal_line = (
+                f"[V31_GOAL] run_id={run_id} goal_id={g['id']} goal_type={goal_type} "
+                f"compat_mode={compat_mode}"
+            )
+            print(goal_line, flush=True)
+            with master_log.open("a", encoding="utf-8") as f:
+                f.write(goal_line + "\n")
+
+            if goal_catalog_version >= 32:
+                detail = object_q if goal_type == "object" else json.dumps(query.get("value", {}), ensure_ascii=False)
+                print(
+                    f"[V32_GOAL] id={g['id']} type={goal_type} resolved=1 details={detail}",
+                    flush=True,
+                )
+
             log_path = logs_dir / f"{run_id}.log"
+
+            if goal_type == "object" and not object_caps_ok:
+                reason = object_caps_reason
+                print(f"[V32_CAPS] object_semantics=0 reason={reason}", flush=True)
+                rec = {
+                    "ts": dt.datetime.now().isoformat(),
+                    "run_id": run_id,
+                    "scene_id": scene_id,
+                    "condition": condition,
+                    "start_id": s["id"],
+                    "start_bucket": s.get("bucket", "unlabeled"),
+                    "start_pose": s.get("pose", {}),
+                    "goal_id": g["id"],
+                    "goal_type": goal_type,
+                    "goal_bucket": g.get("bucket", "unlabeled"),
+                    "goal_aliases": g.get("aliases", []),
+                    "goal_pose": {},
+                    "compat_mode": int(compat_mode),
+                    "room_id": room_id,
+                    "object_query": object_q,
+                    "success": 0,
+                    "fail_type": "invalid_goal",
+                    "reason": reason,
+                    "steps_used": 0,
+                    "final_dist_to_goal_node": -1.0,
+                    "exit_code": 0,
+                    "timed_out": 0,
+                    "renderer_used": "unsupported",
+                    "placeholder_ratio": None,
+                    "camera": {},
+                    "result_json": "",
+                    "log_path": str(log_path),
+                    "debug_index": "",
+                    "trace_stats": {},
+                }
+                with log_path.open("w", encoding="utf-8") as lf:
+                    lf.write(f"# run_id={run_id}\n")
+                    lf.write(f"[V32_CAPS] object_semantics=0 reason={reason}\n")
+                records.append(rec)
+                line = (
+                    f"[V31_RUN] id={run_id} success=0 fail_type=invalid_goal reason={reason} "
+                    f"steps=0 final_dist=-1.000 log={log_path} debug_index="
+                )
+                print(line, flush=True)
+                with master_log.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+                continue
+
+            node_reach_thresh = 0.5
+            if goal_type == "pose":
+                node_reach_thresh = float(g.get("success", {}).get("dist_m", 0.5) or 0.5)
+
             cmd = [
                 "bash",
                 "scripts/gpu/run_isaac_on_5090.sh",
@@ -482,7 +616,7 @@ def main() -> int:
                 "--kidnap_start",
                 "0",
                 "--node_reach_thresh",
-                str(float(g.get("success", {}).get("dist_m", 0.5) or 0.5)),
+                str(node_reach_thresh),
                 "--planner_grid_res",
                 "0.25",
                 "--waypoint_reach_thresh",
@@ -534,6 +668,7 @@ def main() -> int:
                     result = None
 
             debug_run_dir = debug_root / condition / run_id
+            trace_rows = _load_trace_rows(debug_run_dir / "trace.jsonl")
             trace_stats = _load_trace_stats(debug_run_dir)
             fail_type, reason = _classify_fail(result=result, timed_out=timed_out, exit_code=exit_code, trace_stats=trace_stats)
 
@@ -545,6 +680,30 @@ def main() -> int:
             placeholder_ratio = None
             if isinstance(camera.get("fidelity", {}), dict):
                 placeholder_ratio = float(camera.get("fidelity", {}).get("placeholder_ratio", 0.0))
+
+            if goal_type == "room":
+                room_ok, room_metrics = is_room_success_from_trace(trace_rows, g)
+                if room_ok:
+                    success = True
+                    fail_type = "success"
+                    reason = "room_region_settled"
+                    print(
+                        f"[V32_SUCCESS] id={g['id']} type=room ok=1 metric={json.dumps(room_metrics, ensure_ascii=False)}",
+                        flush=True,
+                    )
+                elif success:
+                    success = False
+                    fail_type = "unknown"
+                    reason = "room_settle_not_met"
+            elif goal_type == "pose" and success:
+                last_pose = trace_stats.get("last_pose")
+                if isinstance(last_pose, dict):
+                    pose_ok, pose_metric = is_pose_success(last_pose, g)
+                    if pose_ok:
+                        print(
+                            f"[V32_SUCCESS] id={g['id']} type=pose ok=1 metric={json.dumps(pose_metric, ensure_ascii=False)}",
+                            flush=True,
+                        )
 
             build_debug = (
                 build_debug_ui_mode == "all"
@@ -582,9 +741,13 @@ def main() -> int:
                 "start_bucket": s.get("bucket", "unlabeled"),
                 "start_pose": s.get("pose", {}),
                 "goal_id": g["id"],
+                "goal_type": goal_type,
                 "goal_bucket": g.get("bucket", "unlabeled"),
                 "goal_aliases": g.get("aliases", []),
-                "goal_pose": g.get("value", {}),
+                "goal_pose": query.get("value", {}),
+                "compat_mode": int(compat_mode),
+                "room_id": room_id,
+                "object_query": object_q,
                 "success": int(bool(success)),
                 "fail_type": fail_type,
                 "reason": reason,
@@ -634,9 +797,10 @@ def main() -> int:
     by_bucket = Counter(str(r.get("goal_bucket", "unlabeled")) for r in records)
     by_start = Counter(str(r.get("start_id", "")) for r in records)
     by_goal = Counter(str(r.get("goal_id", "")) for r in records)
+    by_goal_type = Counter(str(r.get("goal_type", "pose")) for r in records)
 
     summary = {
-        "version": 31,
+        "version": int(goal_catalog_version),
         "scene": scene_id,
         "condition": condition,
         "runs_total": len(records),
@@ -646,6 +810,7 @@ def main() -> int:
         "by_goal_bucket": dict(sorted(by_bucket.items())),
         "by_start_id": dict(sorted(by_start.items())),
         "by_goal_id": dict(sorted(by_goal.items())),
+        "by_goal_type": dict(sorted(by_goal_type.items())),
         "starts_used": len(starts),
         "goals_used": len(goals),
         "small_mode": int(bool(args.small)),
@@ -663,18 +828,40 @@ def main() -> int:
 
     by_fail_str = ",".join(f"{k}:{v}" for k, v in sorted(by_fail.items()))
     done_anchor = (
-        f"[V31_SCALE_EVAL] done runs_total={len(records)} success={success_n} failure={fail_n} "
-        f"by_fail_type=\"{by_fail_str}\""
+        f"[{anchor_tag}] done runs_total={len(records)} success={success_n} failure={fail_n} "
+        f"by_fail_type=\"{by_fail_str}\" version={goal_catalog_version}"
     )
     out_anchor = (
-        f"[V31_SCALE_EVAL_OUT] root={out_root} failure_cases={failure_cases} "
+        f"[{anchor_tag}_OUT] root={out_root} failure_cases={failure_cases} "
         f"summary={summary_path} index={index_path}"
     )
     print(done_anchor, flush=True)
     print(out_anchor, flush=True)
+    if anchor_tag != "V31_SCALE_EVAL":
+        legacy_done = (
+            f"[V31_SCALE_EVAL] done runs_total={len(records)} success={success_n} failure={fail_n} "
+            f"by_fail_type=\"{by_fail_str}\" version={goal_catalog_version}"
+        )
+        legacy_out = (
+            f"[V31_SCALE_EVAL_OUT] root={out_root} failure_cases={failure_cases} "
+            f"summary={summary_path} index={index_path} version={goal_catalog_version}"
+        )
+        print(legacy_done, flush=True)
+        print(legacy_out, flush=True)
+    if goal_catalog_version >= 32:
+        v32_out = (
+            f"[V32_SCALE_EVAL_OUT] root={out_root} failure_cases={failure_cases} "
+            f"summary={summary_path} index={index_path}"
+        )
+        print(v32_out, flush=True)
     with master_log.open("a", encoding="utf-8") as f:
         f.write(done_anchor + "\n")
         f.write(out_anchor + "\n")
+        if anchor_tag != "V31_SCALE_EVAL":
+            f.write(legacy_done + "\n")
+            f.write(legacy_out + "\n")
+        if goal_catalog_version >= 32:
+            f.write(v32_out + "\n")
 
     return 0
 

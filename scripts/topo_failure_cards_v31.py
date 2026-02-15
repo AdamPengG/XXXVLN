@@ -62,13 +62,25 @@ def main() -> int:
         scene = str(r.get("scene_id", ""))
         sid = str(r.get("start_id", ""))
         gid = str(r.get("goal_id", ""))
+        gtype = str(r.get("goal_type", "pose"))
         gb = str(r.get("goal_bucket", ""))
+        compat = int(r.get("compat_mode", 0) or 0)
+        room_id = str(r.get("room_id", ""))
+        object_query = str(r.get("object_query", ""))
+        detail = room_id if gtype == "room" else object_query if gtype == "object" else "-"
         log_path = _rel(str(r.get("log_path", "")), out_dir.parent)
         dbg = _rel(str(r.get("debug_index", "")), out_dir.parent)
+        dbg_link = f"<a href='../{dbg}'>debug</a>" if dbg and dbg not in {".", ""} else ""
+        reason_html = (
+            f"<span style='color:#b91c1c;font-weight:600'>{reason}</span>"
+            if fail_type == "invalid_goal"
+            else reason
+        )
         table_rows.append(
-            f"<tr><td>{run_id}</td><td>{scene}</td><td>{sid}</td><td>{gid}</td><td>{gb}</td>"
-            f"<td>{ok}</td><td>{fail_type}</td><td>{reason}</td><td>{steps}</td><td>{dist:.3f}</td>"
-            f"<td><a href='../{log_path}'>log</a></td><td>{('<a href=\'../'+dbg+'\'>debug</a>') if dbg and dbg!='.' else ''}</td></tr>"
+            f"<tr><td>{run_id}</td><td>{scene}</td><td>{sid}</td><td>{gid}</td><td>{gtype}</td>"
+            f"<td>{detail}</td><td>{compat}</td><td>{gb}</td><td>{ok}</td><td>{fail_type}</td>"
+            f"<td>{reason_html}</td><td>{steps}</td><td>{dist:.3f}</td>"
+            f"<td><a href='../{log_path}'>log</a></td><td>{dbg_link}</td></tr>"
         )
 
     top_fail = ", ".join([f"{k}:{v}" for k, v in sorted(by_fail.items())])
@@ -91,7 +103,7 @@ th,td{{border:1px solid #ddd;padding:6px;font-size:12px}}th{{background:#f3f4f6;
   <b>by_fail_type</b>: {top_fail}<br/>
   <b>by_goal_bucket</b>: {top_bucket}</div>
   <table>
-    <thead><tr><th>run_id</th><th>scene</th><th>start_id</th><th>goal_id</th><th>bucket</th><th>success</th><th>fail_type</th><th>reason</th><th>steps</th><th>final_dist</th><th>log</th><th>debug</th></tr></thead>
+    <thead><tr><th>run_id</th><th>scene</th><th>start_id</th><th>goal_id</th><th>goal_type</th><th>room/object</th><th>compat</th><th>bucket</th><th>success</th><th>fail_type</th><th>reason</th><th>steps</th><th>final_dist</th><th>log</th><th>debug</th></tr></thead>
     <tbody>{''.join(table_rows)}</tbody>
   </table>
 </div>

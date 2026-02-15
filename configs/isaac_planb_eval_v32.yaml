@@ -1,0 +1,27 @@
+version: 32
+scene: office_localized
+scenes_config: configs/isaac_scenes_v29.yaml
+goal_catalog: configs/isaac_goal_catalog_v32.yaml
+starts:
+  - id: start_001
+    pose: {x: -2.8, z: -2.5, yaw_deg: 25}
+    bucket: easy
+  - id: start_002
+    pose: {x: 2.2, z: -1.8, yaw_deg: 145}
+    bucket: med
+  - id: start_003
+    pose: {x: 0.0, z: 2.8, yaw_deg: -110}
+    bucket: hard
+selection:
+  include_buckets: ["easy", "med", "hard"]
+  max_goals: 50
+  max_starts: 3
+run:
+  condition: gt_pose
+  max_steps: 60
+  seed: 0
+  renderer: rtx
+  build_debug_ui: failures_only
+  timeout_s: 600
+output:
+  root: runs/topo_mvp/v32_planb_scale_eval

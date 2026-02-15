@@ -1,0 +1,50 @@
+version: 32
+assets_root: /home/peng/isaacsim_assets
+scene: office_localized
+goals:
+  - id: office_pose_001
+    type: pose
+    value:
+      x: -2.8
+      z: -2.5
+      yaw_deg: 25.0
+    success:
+      dist_m: 0.50
+      yaw_deg: 15
+    meta:
+      bucket: easy
+      aliases: ["front_desk_left"]
+      note: "seed pose goal"
+
+  - id: office_room_001
+    type: room
+    value:
+      room_id: office_room_A
+      region:
+        type: aabb
+        min: {x: -4.0, z: -4.0}
+        max: {x: 0.0, z: 0.0}
+      anchor_poses:
+        - {x: -2.0, z: -2.0, yaw_deg: 0.0}
+    success:
+      inside: true
+      settle_steps: 5
+    meta:
+      bucket: easy
+      aliases: ["reception"]
+      note: "room region goal"
+
+  - id: office_obj_001
+    type: object
+    value:
+      query:
+        name_contains: "Printer"
+      require_visible: true
+      max_range_m: 1.5
+    success:
+      visible: true
+      range_m: 1.5
+    meta:
+      bucket: med
+      aliases: ["printer"]
+      note: "object goal; short-circuit invalid_goal when semantics unavailable"
