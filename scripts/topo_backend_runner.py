@@ -287,6 +287,7 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             print(f"[ISAAC_BACKEND_ERROR] reason={reason}", flush=True)
         raise
     backend_mode = getattr(backend, "backend_mode", args.backend)
+    renderer_used = getattr(backend, "renderer_used", "unknown")
 
     node_xyz = np.stack(
         [np.asarray(node.position, dtype=np.float32) for _, node in sorted(graph.nodes.items())],
@@ -623,6 +624,7 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
         "query": str(args.query),
         "backend": str(args.backend),
         "backend_mode": str(backend_mode),
+        "renderer_used": str(renderer_used),
         "success": bool(success),
         "fail_reason": fail_reason if not success else None,
         "terminated_by": str(terminated_by or ("success_stop" if success else "max_steps")),
@@ -698,6 +700,7 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             "terminated_by": str(result["terminated_by"]),
             "fail_reason": result["fail_reason"],
             "controller_mode": str(args.controller_mode),
+            "renderer_used": str(renderer_used),
             "max_steps": int(args.max_steps),
             "node_reach_thresh": float(args.node_reach_thresh),
             "goal_node": int(goal_node),

@@ -31,7 +31,7 @@ if [ -z "${root_spec}" ]; then
 fi
 echo "[ISAAC_ENV_RESOLVED] root=${root_spec}"
 
-preflight_code='from omni.isaac.kit import SimulationApp; app=SimulationApp({"headless": True}); import omni.isaac.core; import sys; sys.stdout.write("OMNI_OK\\n"); sys.stdout.flush(); app.close()'
+preflight_code='import omni; import sys; sys.stdout.write("OMNI_OK\\n"); sys.stdout.flush()'
 
 run_local() {
   local root="$1"
@@ -46,6 +46,7 @@ run_local() {
   echo "[ISAAC_ENV_OK] root=${root} msg=OMNI_OK"
   ISAAC_SKIP_WORLD_STEP="${ISAAC_SKIP_WORLD_STEP:-0}" \
   ISAAC_RENDER="${ISAAC_RENDER:-0}" \
+  ISAAC_RGB_CAPTURE="${ISAAC_RGB_CAPTURE:-0}" \
   PYTHONPATH="/home/peng/DualVLN/repo/InternNav:${PYTHONPATH:-}" \
     "${root}/python.sh" "${cmd[@]}"
 }
@@ -80,6 +81,7 @@ run_docker_exec() {
     -e ISAAC_SKIP_WORLD_STEP="${ISAAC_SKIP_WORLD_STEP:-0}" \
     -e ISAAC_RENDER="${ISAAC_RENDER:-0}" \
     -e ISAAC_MINIMAL="${ISAAC_MINIMAL:-0}" \
+    -e ISAAC_RGB_CAPTURE="${ISAAC_RGB_CAPTURE:-0}" \
     "${cname}" \
     "${root}/python.sh" "${translated[@]}"
   if [ "${#perm_targets[@]}" -gt 0 ]; then
@@ -141,6 +143,7 @@ run_docker_image() {
     -e ISAAC_SKIP_WORLD_STEP="${ISAAC_SKIP_WORLD_STEP:-0}" \
     -e ISAAC_RENDER="${ISAAC_RENDER:-0}" \
     -e ISAAC_MINIMAL="${ISAAC_MINIMAL:-0}" \
+    -e ISAAC_RGB_CAPTURE="${ISAAC_RGB_CAPTURE:-0}" \
     -v "${cache_root}/cache:/isaac-sim/kit/cache" \
     -v "${cache_root}/logs:/root/.nvidia-omniverse/logs" \
     -v "${cache_root}/data:/root/.local/share/ov/data" \

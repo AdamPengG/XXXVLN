@@ -105,6 +105,66 @@ def main() -> int:
     print(f"[ISAAC_SANITY] yaw_left_mean={yaw_left_mean:.4f} yaw_right_mean={yaw_right_mean:.4f}", flush=True)
     print(f"[ISAAC_SANITY] heading_alignment_cos={align_mean:.4f}", flush=True)
 
+    # ── v26 render smoke test ─────────────────────────────────────────────
+    # Isaac camera may need several render passes to warm up; do a few extra
+    # forward steps to ensure the renderer has produced real pixels.
+    for _ in range(5):
+        obs, _, _ = backend.step(1)
+    rgb = backend.get_rgb()
+    rgb_ok = False
+    rgb_reason = "not_tested"
+    rgb_var = 0.0
+    if rgb is not None and rgb.ndim == 3 and rgb.shape[-1] >= 3:
+        h_img, w_img = rgb.shape[:2]
+        rgb_f = rgb.astype(np.float32)
+        rgb_var = float(np.var(rgb_f))
+
+        # Detect known placeholder gradient signature:
+        # _synthetic_rgbd produces R ∝ col_index, G ∝ row_index, B ∝ (1-col)
+        # Check if R-channel is highly correlated with a horizontal ramp.
+        is_placeholder = False
+        if h_img > 4 and w_img > 4:
+            col_ramp = np.tile(np.linspace(0, 1, w_img, dtype=np.float32), (h_img, 1))
+            row_ramp = np.tile(np.linspace(0, 1, h_img, dtype=np.float32).reshape(-1, 1), (1, w_img))
+            r_ch = rgb_f[:, :, 0] / 255.0
+            g_ch = rgb_f[:, :, 1] / 255.0
+
+            def _corr(a, b):
+                a_flat = a.ravel()
+                b_flat = b.ravel()
+                a_m = a_flat - float(np.mean(a_flat))
+                b_m = b_flat - float(np.mean(b_flat))
+                denom = float(np.sqrt(np.sum(a_m * a_m) * np.sum(b_m * b_m) + 1e-12))
+                return float(np.sum(a_m * b_m) / denom)
+
+            corr_r_col = abs(_corr(r_ch, col_ramp))
+            corr_g_row = abs(_corr(g_ch, row_ramp))
+            # Both channels matching gradient → placeholder
+            if corr_r_col > 0.88 and corr_g_row > 0.88:
+                is_placeholder = True
+
+        if is_placeholder:
+            rgb_reason = "placeholder_detected"
+        elif rgb_var < 100.0:
+            rgb_reason = "low_variance"
+        else:
+            rgb_ok = True
+            rgb_reason = "real"
+    else:
+        rgb_reason = "bad_shape" if rgb is not None else "rgb_none"
+
+    if rgb_ok:
+        h_img, w_img = rgb.shape[:2]
+        print(
+            f"[ISAAC_RENDER_SMOKE] ok=1 width={w_img} height={h_img} var={rgb_var:.1f}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[ISAAC_RENDER_SMOKE] ok=0 reason={rgb_reason} var={rgb_var:.1f}",
+            flush=True,
+        )
+
     if fwd_mean < 0.02 or align_mean < 0.7:
         print(
             f"[ISAAC_SANITY_FAIL] forward_step_mean={fwd_mean:.4f} heading_alignment_cos={align_mean:.4f}",
@@ -112,6 +172,17 @@ def main() -> int:
         )
         backend.close()
         return 2
+
+    # v26: if RGB capture is requested but render smoke failed, exit non-zero
+    rgb_capture_requested = bool(int(os.environ.get("ISAAC_RGB_CAPTURE", "0")))
+    if rgb_capture_requested and not rgb_ok:
+        print(
+            f"[ISAAC_RENDER_SMOKE_FAIL] reason={rgb_reason} rgb_capture_was_requested=1",
+            flush=True,
+        )
+        backend.close()
+        return 3
+
     backend.close()
     return 0
 

@@ -11,6 +11,20 @@ if has_python_sh "${ISAAC_SIM_ROOT:-}"; then
   exit 0
 fi
 
+# Preferred local installs on this machine.
+declare -a preferred=(
+  "/home/peng/IsaacSim/_build/linux-x86_64/release"
+  "/home/peng/IsaacSim"
+  "/home/peng/FirstVLN/IsaacSim/_build/linux-x86_64/release"
+  "/home/peng/FirstVLN/IsaacSim"
+)
+for p in "${preferred[@]}"; do
+  if has_python_sh "${p}"; then
+    printf '%s\n' "${p}"
+    exit 0
+  fi
+done
+
 declare -a roots=(
   "/home/peng/FirstVLN"
   "/home/peng"
@@ -29,6 +43,7 @@ for r in "${roots[@]}"; do
   done < <(
     find "${r}" -maxdepth 7 -type f -name "python.sh" 2>/dev/null \
       | grep -Ei 'isaac|ov/pkg|omniverse' \
+      | grep -Ev '/\.cache/packman/' \
       | sort -u
   )
 done

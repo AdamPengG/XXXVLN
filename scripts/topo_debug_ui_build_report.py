@@ -160,6 +160,9 @@ HTML_TEMPLATE = """<!doctype html>
       <div class="row"><span class="kpi">Termination</span>: <span id="termInfo"></span></div>
       <div class="row"><span class="kpi">Oracle</span>: <span id="oracleInfo"></span></div>
       <div class="row"><span class="kpi">Forensics</span>: <span id="forensicsInfo"></span></div>
+      <div class="row"><span class="kpi">Goal</span>: <span id="goalInfo"></span></div>
+      <div class="row"><span class="kpi">Renderer</span>: <span id="rendererInfo"></span></div>
+      <div class="row"><span class="kpi">RGB Capture</span>: <span id="rgbCaptureInfo"></span></div>
       <input id="stepSlider" type="range" min="0" max="0" value="0" style="width:100%"/>
       <div class="row">Step: <span id="stepText"></span></div>
       <img id="frame" src="" alt="frame"/>
@@ -263,6 +266,17 @@ function updateUI(meta, trace, graph, step){
   document.getElementById('oracleInfo').textContent = `available=${o.oracle_available||0}, success=${o.oracle_success||0}, geo_start=${(o.oracle_geodesic_start||0).toFixed?o.oracle_geodesic_start.toFixed(3):o.oracle_geodesic_start}, geo_final=${(o.oracle_geodesic_final||0).toFixed?o.oracle_geodesic_final.toFixed(3):o.oracle_geodesic_final}`;
   const f=meta.forensics||{};
   document.getElementById('forensicsInfo').textContent = `drift=${f.cause_localization_drift?1:0}, oscillation=${f.cause_controller_oscillation?1:0}, fwd_no_motion=${f.cause_fwd_no_motion?1:0}, dataset_issue=${f.cause_dataset_reachability?1:0}`;
+  const gi=meta.goal_info||{};
+  document.getElementById('goalInfo').textContent = gi.goal_id ? `id=${gi.goal_id}, type=${gi.goal_type||'pose'}, pose=(${(gi.goal_pose||{}).x||'?'},${(gi.goal_pose||{}).z||'?'}), topK=${JSON.stringify(gi.topk_matches||[])}` : 'n/a (v24 run)';
+  const rcs=meta.rgb_capture_stats||{};
+  const rgbOk=rcs.rgb_ok||0, rgbPh=rcs.rgb_placeholder||0;
+  const rgbTotal=rgbOk+rgbPh;
+  const ratio = rgbTotal>0 ? (rgbPh/rgbTotal) : 0;
+  const rgbOkFlag = rgbTotal>0 ? (ratio < 0.5 ? 1 : 0) : 0;
+  let rgbMsg=`rgb_ok=${rgbOkFlag}, real=${rgbOk}, placeholder=${rgbPh}, placeholder_ratio=${ratio.toFixed(3)}`;
+  if(rgbTotal>0 && rgbPh>rgbTotal*0.5){ rgbMsg+=' ⚠ PLACEHOLDER DOMINANT'; document.getElementById('rgbCaptureInfo').style.color='#d97706'; } else { document.getElementById('rgbCaptureInfo').style.color=''; }
+  document.getElementById('rgbCaptureInfo').textContent = rgbTotal>0 ? rgbMsg : 'n/a';
+  document.getElementById('rendererInfo').textContent = `${meta.renderer_used || 'unknown'}`;
   const img=document.getElementById('frame');
   img.src = row.frame_rgb ? ('../'+row.frame_rgb) : '';
   document.getElementById('telemetry').textContent = JSON.stringify({
