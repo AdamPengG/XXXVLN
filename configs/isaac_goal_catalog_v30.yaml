@@ -1,0 +1,19 @@
+version: 30
+assets_root: /home/peng/isaacsim_assets
+scene: office_localized
+goals:
+  - id: office_pose_001
+    type: pose
+    value:
+      x: -2.8
+      z: -2.5
+      yaw_deg: 25.0
+    success:
+      dist_m: 0.50
+      yaw_deg: 15
+    meta:
+      bucket: easy
+      aliases: ["front_desk_left"]
+      note: "seed goal from default start"
+      author: "peng"
+      created_at: "2026-02-15"
