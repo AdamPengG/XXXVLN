@@ -244,6 +244,20 @@ def _load_trace_rows(trace_path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def _parse_v33a_log(log_path: Path) -> Dict[str, int]:
+    out = {"stuck_triggers": 0, "recoveries": 0, "giveup": 0}
+    if not log_path.exists():
+        return out
+    for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if "[V33A_STUCK]" in line and "trigger=1" in line:
+            out["stuck_triggers"] += 1
+        if "[V33A_RECOVERY]" in line and "start" in line:
+            out["recoveries"] += 1
+        if "[V33A_RECOVERY]" in line and "giveup" in line:
+            out["giveup"] += 1
+    return out
+
+
 def _classify_fail(
     result: Optional[Dict[str, Any]],
     timed_out: bool,
@@ -264,6 +278,10 @@ def _classify_fail(
     steps = int(result.get("steps_used", 0) or 0)
     max_steps = int(result.get("max_steps", 0) or 0)
 
+    if "stuck" in fail_reason.lower():
+        return "stuck", fail_reason
+    if "room_settle_not_met" in fail_reason:
+        return "max_steps", fail_reason
     if "invalid_goal" in fail_reason:
         return "invalid_goal", fail_reason
     if "max_steps" in fail_reason or term == "max_steps" or (max_steps > 0 and steps >= max_steps):
@@ -297,6 +315,9 @@ def _write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         "final_dist_to_goal_node",
         "exit_code",
         "timed_out",
+        "v33a_stuck_triggers",
+        "v33a_recovery_count",
+        "v33a_recovery_giveup",
         "log_path",
         "debug_index",
     ]
@@ -551,6 +572,9 @@ def main() -> int:
                     "log_path": str(log_path),
                     "debug_index": "",
                     "trace_stats": {},
+                    "v33a_stuck_triggers": 0,
+                    "v33a_recovery_count": 0,
+                    "v33a_recovery_giveup": 0,
                 }
                 with log_path.open("w", encoding="utf-8") as lf:
                     lf.write(f"# run_id={run_id}\n")
@@ -670,7 +694,10 @@ def main() -> int:
             debug_run_dir = debug_root / condition / run_id
             trace_rows = _load_trace_rows(debug_run_dir / "trace.jsonl")
             trace_stats = _load_trace_stats(debug_run_dir)
+            v33a_stats = _parse_v33a_log(log_path)
             fail_type, reason = _classify_fail(result=result, timed_out=timed_out, exit_code=exit_code, trace_stats=trace_stats)
+            if fail_type == "unknown" and int(v33a_stats.get("giveup", 0)) > 0:
+                fail_type, reason = "stuck", "v33a_recovery_giveup"
 
             success = bool(result.get("success", False)) if isinstance(result, dict) else False
             steps_used = int(result.get("steps_used", 0)) if isinstance(result, dict) else 0
@@ -693,7 +720,7 @@ def main() -> int:
                     )
                 elif success:
                     success = False
-                    fail_type = "unknown"
+                    fail_type = "max_steps"
                     reason = "room_settle_not_met"
             elif goal_type == "pose" and success:
                 last_pose = trace_stats.get("last_pose")
@@ -762,6 +789,9 @@ def main() -> int:
                 "log_path": str(log_path),
                 "debug_index": debug_index,
                 "trace_stats": trace_stats,
+                "v33a_stuck_triggers": int(v33a_stats.get("stuck_triggers", 0)),
+                "v33a_recovery_count": int(v33a_stats.get("recoveries", 0)),
+                "v33a_recovery_giveup": int(v33a_stats.get("giveup", 0)),
             }
             records.append(rec)
 
@@ -798,6 +828,9 @@ def main() -> int:
     by_start = Counter(str(r.get("start_id", "")) for r in records)
     by_goal = Counter(str(r.get("goal_id", "")) for r in records)
     by_goal_type = Counter(str(r.get("goal_type", "pose")) for r in records)
+    stuck_triggers_total = int(sum(int(r.get("v33a_stuck_triggers", 0) or 0) for r in records))
+    recoveries_total = int(sum(int(r.get("v33a_recovery_count", 0) or 0) for r in records))
+    stuck_failures = int(sum(1 for r in records if str(r.get("fail_type", "")) == "stuck"))
 
     summary = {
         "version": int(goal_catalog_version),
@@ -813,6 +846,11 @@ def main() -> int:
         "by_goal_type": dict(sorted(by_goal_type.items())),
         "starts_used": len(starts),
         "goals_used": len(goals),
+        "v33a": {
+            "stuck_triggers": stuck_triggers_total,
+            "recoveries": recoveries_total,
+            "stuck_failures": stuck_failures,
+        },
         "small_mode": int(bool(args.small)),
         "paths": {
             "failure_cases": str(failure_cases),
@@ -837,6 +875,11 @@ def main() -> int:
     )
     print(done_anchor, flush=True)
     print(out_anchor, flush=True)
+    v33a_anchor = (
+        f"[V33A_SUMMARY] stuck_triggers={stuck_triggers_total} "
+        f"recoveries={recoveries_total} stuck_failures={stuck_failures}"
+    )
+    print(v33a_anchor, flush=True)
     if anchor_tag != "V31_SCALE_EVAL":
         legacy_done = (
             f"[V31_SCALE_EVAL] done runs_total={len(records)} success={success_n} failure={fail_n} "
@@ -857,6 +900,7 @@ def main() -> int:
     with master_log.open("a", encoding="utf-8") as f:
         f.write(done_anchor + "\n")
         f.write(out_anchor + "\n")
+        f.write(v33a_anchor + "\n")
         if anchor_tag != "V31_SCALE_EVAL":
             f.write(legacy_done + "\n")
             f.write(legacy_out + "\n")

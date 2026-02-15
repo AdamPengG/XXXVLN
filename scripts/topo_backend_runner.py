@@ -58,6 +58,27 @@ def _bearing_distance_from_yaw(curr_pos: np.ndarray, curr_yaw: float, target_pos
     return float(bearing), float(dist)
 
 
+def _wrap_pi(x: float) -> float:
+    return float((float(x) + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+def _count_sign_flips(vals: List[float], eps: float) -> int:
+    signs: List[int] = []
+    for v in vals:
+        if abs(float(v)) < float(eps):
+            continue
+        signs.append(1 if v > 0.0 else -1)
+    if len(signs) <= 1:
+        return 0
+    flips = 0
+    prev = signs[0]
+    for s in signs[1:]:
+        if s != prev:
+            flips += 1
+        prev = s
+    return int(flips)
+
+
 def _nearest_node(position: np.ndarray, graph: TopoGraph) -> Tuple[int, float]:
     best_id = None
     best_dist = float("inf")
@@ -382,6 +403,9 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
     relocalize_reset_count = 0
     doorway_burst_count = 0
     fill_triggers = 0
+    v33a_stuck_triggers = 0
+    v33a_recovery_count = 0
+    v33a_stuck_fail = 0
 
     turn_thresh_rad = float(args.turn_thresh)
     bearing_ctrl = BearingController(
@@ -394,8 +418,18 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
         flush=True,
     )
     print("[TOPO_CTRL_FRAME] forward_axis=-Z yaw_sign=+", flush=True)
+    print(
+        f"[V33A_STUCK_CFG] window={int(args.stuck_window)} dist_eps={float(args.stuck_dist_eps):.3f} "
+        f"yaw_eps={float(args.oscillation_yaw_eps_deg):.1f}",
+        flush=True,
+    )
     dist_trace: Deque[float] = collections.deque(maxlen=max(3, int(args.stall_window)))
     goal_dist_trace: Deque[float] = collections.deque(maxlen=max(3, int(args.stall_window)))
+    stuck_pos_trace: Deque[np.ndarray] = collections.deque(maxlen=max(4, int(args.stuck_window) + 1))
+    stuck_dist_trace: Deque[float] = collections.deque(maxlen=max(4, int(args.stuck_window)))
+    yaw_delta_trace: Deque[float] = collections.deque(maxlen=max(4, int(args.stuck_window)))
+    recovery_queue: Deque[int] = collections.deque()
+    recovery_cooldown = 0
 
     done = False
     success = False
@@ -471,6 +505,8 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             goal_pos_now = np.array(goal_pos, dtype=np.float32)
             bearing, dist = _bearing_distance_from_yaw(curr_pos, float(obs.pose.yaw), target_pos)
             _, dist_goal = _bearing_distance_from_yaw(curr_pos, float(obs.pose.yaw), goal_pos_now)
+            stuck_pos_trace.append(np.array([float(curr_pos[0]), float(curr_pos[2])], dtype=np.float32))
+            stuck_dist_trace.append(float(dist))
 
             if str(args.controller_mode).strip().lower() == "waypoint_follow" and planner_ok:
                 if float(dist) <= float(args.waypoint_reach_thresh):
@@ -514,7 +550,88 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                 )
                 break
 
-            if args.controller_mode == "follower":
+            stuck_triggered = False
+            stuck_type = ""
+            stuck_details = ""
+            if recovery_cooldown > 0:
+                recovery_cooldown -= 1
+            if not recovery_queue and recovery_cooldown <= 0 and len(stuck_pos_trace) >= max(3, int(args.stuck_window)):
+                seg = list(stuck_pos_trace)
+                cum_move = 0.0
+                for ii in range(1, len(seg)):
+                    cum_move += float(np.linalg.norm(seg[ii] - seg[ii - 1]))
+                subgoal_improve = 0.0
+                if len(stuck_dist_trace) > 0:
+                    subgoal_improve = float(stuck_dist_trace[0] - min(stuck_dist_trace))
+                flips = _count_sign_flips(list(yaw_delta_trace), eps=math.radians(float(args.oscillation_yaw_eps_deg)))
+                turn_big = sum(1 for yy in yaw_delta_trace if abs(float(yy)) >= math.radians(float(args.oscillation_yaw_eps_deg)))
+                stuck_plain = cum_move < float(args.stuck_dist_eps) and subgoal_improve < float(args.stall_min_delta)
+                oscillation = (
+                    turn_big >= int(args.oscillation_min_turns)
+                    and flips >= int(args.oscillation_flip_min)
+                    and subgoal_improve < float(args.stall_min_delta)
+                )
+                if stuck_plain or oscillation:
+                    stuck_triggered = True
+                    stuck_type = "oscillation" if oscillation else "stuck"
+                    stuck_details = (
+                        f"cum_move={cum_move:.3f},subgoal_improve={subgoal_improve:.3f},"
+                        f"flips={flips},turn_big={turn_big}"
+                    )
+
+            if stuck_triggered:
+                v33a_stuck_triggers += 1
+                print(
+                    f"[V33A_STUCK] trigger=1 type={stuck_type} step={step} details={stuck_details}",
+                    flush=True,
+                )
+                if v33a_recovery_count >= int(args.stuck_max_recoveries):
+                    v33a_stuck_fail = 1
+                    fail_reason = "stuck"
+                    terminated_by = "early_stop"
+                    print(
+                        f"[V33A_RECOVERY] giveup count={v33a_recovery_count} fail_type=stuck",
+                        flush=True,
+                    )
+                    break
+                v33a_recovery_count += 1
+                k = max(1, int(args.stuck_recovery_scan_k))
+                recovery_queue = collections.deque([2] * k + [3] * (2 * k) + [2] * k)
+                recovery_cooldown = max(2, int(args.stuck_window) // 2)
+                print(f"[V33A_RECOVERY] start step={step} kind=scan k={k}", flush=True)
+                replan_ok = False
+                replan_reason = "graph_replan"
+                if str(args.controller_mode).strip().lower() == "waypoint_follow":
+                    if hasattr(backend, "get_bounds") and hasattr(backend, "get_obstacles"):
+                        ok, waypoints, meta = plan_grid_path(
+                            bounds=list(getattr(backend, "get_bounds")()),
+                            obstacles=list(getattr(backend, "get_obstacles")()),
+                            start=np.array([obs.pose.x, obs.pose.y, obs.pose.z], dtype=np.float32),
+                            goal=goal_pos,
+                            meters_per_cell=float(args.planner_grid_res),
+                            max_nodes=int(args.planner_max_nodes),
+                        )
+                        planner_meta = dict(meta)
+                        if ok and len(waypoints) > 0:
+                            planner_ok = True
+                            planner_waypoints = [(float(x), float(z)) for x, z in waypoints]
+                            waypoint_idx = 0
+                            replan_ok = True
+                            replan_reason = f"planner_waypoints={len(planner_waypoints)}"
+                        else:
+                            replan_reason = "planner_no_path"
+                    else:
+                        replan_reason = "planner_backend_missing"
+                else:
+                    replan_ok = True
+                print(f"[V33A_RECOVERY] replan ok={int(replan_ok)} reason={replan_reason}", flush=True)
+
+            recovery_event_labels: List[str] = []
+            if recovery_queue:
+                action = int(recovery_queue.popleft())
+                action_name = "LEFT" if action == 2 else "RIGHT" if action == 3 else "STOP" if action == 0 else "FORWARD"
+                recovery_event_labels.append("v33a_recovery_scan")
+            elif args.controller_mode == "follower":
                 if dist <= float(args.stop_thresh):
                     action, action_name = 0, "STOP"
                 elif abs(bearing) > turn_thresh_rad * 0.8:
@@ -528,6 +645,8 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             obs_next, env_done, info = backend.step(int(action))
             new_pos = np.array([obs_next.pose.x, obs_next.pose.y, obs_next.pose.z], dtype=np.float32)
             moved = float(np.linalg.norm(new_pos - prev_pos))
+            yaw_delta = _wrap_pi(float(obs_next.pose.yaw) - float(obs.pose.yaw))
+            yaw_delta_trace.append(float(yaw_delta))
             fwd_no_motion = bool(int(action) == 1 and moved < 0.01)
             if args.controller_mode != "follower":
                 bearing_ctrl.update_after_step(int(action), moved)
@@ -576,11 +695,13 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                 "belief_entropy": float(last_entropy),
                 "belief_topk": [{"node": int(n), "prob": float(p)} for n, p in last_topk],
                 "room_id_current": int(room_id),
-                "recovery_event": ["watchdog_no_progress"] if watchdog_trigger_count > 0 else [],
                 "fwd_no_motion": int(bool(fwd_no_motion)),
                 "collision": None if last_collision is None else int(bool(last_collision)),
                 "goal_score": float(goal_score),
             }
+            if watchdog_trigger_count > 0:
+                recovery_event_labels.append("watchdog_no_progress")
+            rec["recovery_event"] = recovery_event_labels
             debug_buf.push(record=rec, rgb=rgb, depth=depth, event_frame=bool(fwd_no_motion))
 
             path_poses.append(
@@ -644,6 +765,9 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
         "watchdog_trigger_count": int(watchdog_trigger_count),
         "relocalize_reset_count": int(relocalize_reset_count),
         "doorway_burst_count": int(doorway_burst_count),
+        "v33a_stuck_trigger_count": int(v33a_stuck_triggers),
+        "v33a_recovery_count": int(v33a_recovery_count),
+        "v33a_stuck_fail": int(v33a_stuck_fail),
         "belief_entropy_summary": {
             "mean": float(last_entropy),
             "max": float(last_entropy),
@@ -806,6 +930,33 @@ def main() -> None:
     ap.add_argument("--waypoint_reach_thresh", type=float, default=float(os.environ.get("ISAAC_WAYPOINT_REACH", "0.45")))
     ap.add_argument("--stall_window", type=int, default=20)
     ap.add_argument("--stall_min_delta", type=float, default=0.1)
+    ap.add_argument("--stuck_window", type=int, default=int(os.environ.get("STUCK_WINDOW", "20")))
+    ap.add_argument("--stuck_dist_eps", type=float, default=float(os.environ.get("STUCK_DIST_EPS", "0.05")))
+    ap.add_argument(
+        "--oscillation_yaw_eps_deg",
+        type=float,
+        default=float(os.environ.get("OSCILLATION_YAW_EPS", "10.0")),
+    )
+    ap.add_argument(
+        "--oscillation_flip_min",
+        type=int,
+        default=int(os.environ.get("OSCILLATION_FLIP_MIN", "4")),
+    )
+    ap.add_argument(
+        "--oscillation_min_turns",
+        type=int,
+        default=int(os.environ.get("OSCILLATION_MIN_TURNS", "6")),
+    )
+    ap.add_argument(
+        "--stuck_recovery_scan_k",
+        type=int,
+        default=int(os.environ.get("STUCK_RECOVERY_SCAN_K", "2")),
+    )
+    ap.add_argument(
+        "--stuck_max_recoveries",
+        type=int,
+        default=int(os.environ.get("STUCK_MAX_RECOVERIES", "3")),
+    )
     ap.add_argument("--stop_near_m", type=float, default=1.25)
     ap.add_argument("--stop_near_goal_score_min", type=float, default=0.05)
     ap.add_argument("--stop_near_loc_conf_min", type=float, default=0.35)
