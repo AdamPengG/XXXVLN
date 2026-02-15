@@ -302,6 +302,12 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
         "reference_nodes_xyz": node_xyz.tolist(),
     }
     obs = backend.reset(scene_id=args.scene_id, start_spec=start_spec)
+    camera_info: Dict[str, object] = {}
+    if hasattr(backend, "get_camera_info"):
+        try:
+            camera_info = dict(getattr(backend, "get_camera_info")())
+        except Exception:
+            camera_info = {}
 
     goal_pos = np.array(graph.nodes[goal_node].position, dtype=np.float32)
     if goal_pose_override is not None:
@@ -644,6 +650,7 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             "min": float(last_entropy),
         },
         "fill_triggers": int(fill_triggers),
+        "camera": camera_info,
     }
 
     run_debug_dir = os.path.join(
@@ -701,6 +708,7 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             "fail_reason": result["fail_reason"],
             "controller_mode": str(args.controller_mode),
             "renderer_used": str(renderer_used),
+            "camera": camera_info,
             "max_steps": int(args.max_steps),
             "node_reach_thresh": float(args.node_reach_thresh),
             "goal_node": int(goal_node),

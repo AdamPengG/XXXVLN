@@ -162,6 +162,7 @@ HTML_TEMPLATE = """<!doctype html>
       <div class="row"><span class="kpi">Forensics</span>: <span id="forensicsInfo"></span></div>
       <div class="row"><span class="kpi">Goal</span>: <span id="goalInfo"></span></div>
       <div class="row"><span class="kpi">Renderer</span>: <span id="rendererInfo"></span></div>
+      <div class="row"><span class="kpi">Camera</span>: <span id="cameraInfo"></span></div>
       <div class="row"><span class="kpi">RGB Capture</span>: <span id="rgbCaptureInfo"></span></div>
       <input id="stepSlider" type="range" min="0" max="0" value="0" style="width:100%"/>
       <div class="row">Step: <span id="stepText"></span></div>
@@ -268,6 +269,16 @@ function updateUI(meta, trace, graph, step){
   document.getElementById('forensicsInfo').textContent = `drift=${f.cause_localization_drift?1:0}, oscillation=${f.cause_controller_oscillation?1:0}, fwd_no_motion=${f.cause_fwd_no_motion?1:0}, dataset_issue=${f.cause_dataset_reachability?1:0}`;
   const gi=meta.goal_info||{};
   document.getElementById('goalInfo').textContent = gi.goal_id ? `id=${gi.goal_id}, type=${gi.goal_type||'pose'}, pose=(${(gi.goal_pose||{}).x||'?'},${(gi.goal_pose||{}).z||'?'}), topK=${JSON.stringify(gi.topk_matches||[])}` : 'n/a (v24 run)';
+  const cam = (meta && meta.camera) ? meta.camera : {};
+  const camFid = (cam && cam.fidelity) ? cam.fidelity : {};
+  const camW = cam.camera_w ?? '?';
+  const camH = cam.camera_h ?? '?';
+  const camFov = cam.camera_fov_deg ?? '?';
+  const camAuto = cam.auto_exposure ?? '?';
+  const camExp = cam.exposure ?? '?';
+  const camPlace = camFid.placeholder_ratio ?? '?';
+  document.getElementById('cameraInfo').textContent =
+    `${camW}x${camH}, fov=${camFov}, auto_exp=${camAuto}, exp=${camExp}, placeholder_ratio=${camPlace}`;
   const rcs=meta.rgb_capture_stats||{};
   const rgbOk=rcs.rgb_ok||0, rgbPh=rcs.rgb_placeholder||0;
   const rgbTotal=rgbOk+rgbPh;
