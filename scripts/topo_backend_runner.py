@@ -524,6 +524,10 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
     v33b_doorway_hyst = 0
     v33b_offsets = _parse_offsets_deg(args.v33b_offsets_deg)
     v33b_fov_deg = float(camera_info.get("camera_fov_deg", 90.0)) if isinstance(camera_info, dict) else 90.0
+    v33b_near = float(camera_info.get("camera_near", 0.05)) if isinstance(camera_info, dict) else 0.05
+    v33b_far = float(camera_info.get("camera_far", 50.0)) if isinstance(camera_info, dict) else 50.0
+    v33b_steer_latch_side = 0
+    v33b_steer_latch_steps = 0
     if v33b_enabled:
         print(
             f"[V33B_CFG] enable=1 require_depth={int(args.v33b_require_depth)} clearance_m={float(args.v33b_clearance_m):.2f} "
@@ -776,8 +780,6 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                         d = d[..., 0]
                     v33b_depth_ready = True
                     v33b_depth_source = str(depth_source)
-                    finite = np.isfinite(d) & (d > 1e-4)
-                    valid_ratio = float(finite.mean()) if d.size > 0 else 0.0
                     if (not v33b_depth_caps_logged) and d.ndim == 2:
                         print(
                             f"[V33B_CAPS] depth=1 h={int(d.shape[0])} w={int(d.shape[1])} "
@@ -785,27 +787,29 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                             flush=True,
                         )
                         v33b_depth_caps_logged = True
-                    if not v33b_depth_stats_logged and finite.any():
-                        vals = d[finite]
-                        print(
-                            f"[V33B_DEPTH_STATS] valid_ratio={valid_ratio:.3f} "
-                            f"p5={float(np.percentile(vals, 5)):.3f} "
-                            f"p50={float(np.percentile(vals, 50)):.3f} "
-                            f"p95={float(np.percentile(vals, 95)):.3f}",
-                            flush=True,
-                        )
-                        v33b_depth_stats_logged = True
                     if d.ndim == 2 and d.size > 0:
                         h, w = int(d.shape[0]), int(d.shape[1])
                         y0 = int(np.clip(float(args.v33b_strip_y0_frac) * h, 0, max(0, h - 1)))
                         y1 = int(np.clip(float(args.v33b_strip_y1_frac) * h, y0 + 1, h))
+                        # Always mask out bottom 10% rows to reduce floor contamination.
+                        y_floor_cap = max(y0 + 1, int(0.90 * h))
+                        y1 = min(y1, y_floor_cap)
+                        if y1 <= y0:
+                            y1 = min(h, y0 + 1)
                         strip_w = max(1, int(float(args.v33b_strip_w_frac) * w))
+                        low = float(v33b_near + 1e-3)
+                        high = float(max(low + 1e-3, v33b_far))
+                        d_clip = np.asarray(d, dtype=np.float32).copy()
+                        valid_global = np.isfinite(d_clip)
+                        valid_global &= d_clip >= low
+                        valid_global &= d_clip <= high
+                        d_clip[~valid_global] = np.nan
 
                         offset_metrics: Dict[float, Tuple[float, float]] = {}
                         for off in v33b_offsets:
                             col = int(round((w * 0.5) + (float(off) / max(1e-3, float(v33b_fov_deg))) * w))
                             clr, vr = _depth_strip_clearance(
-                                d,
+                                d_clip,
                                 col_center=col,
                                 strip_w=strip_w,
                                 y0=y0,
@@ -817,65 +821,100 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
 
                         center_off = min(v33b_offsets, key=lambda x: abs(float(x)))
                         center_clr, center_vr = offset_metrics.get(float(center_off), (0.0, 0.0))
-                        blocked = bool(
-                            (center_vr < float(args.v33b_min_valid_ratio))
-                            or (center_clr < float(args.v33b_clearance_m))
-                        )
-                        if blocked:
-                            v33b_blocked_count += 1
-
                         best_off = max(v33b_offsets, key=lambda x: offset_metrics.get(float(x), (0.0, 0.0))[0])
                         best_clr = offset_metrics.get(float(best_off), (0.0, 0.0))[0]
-                        occ_patch = d[y0:y1, :]
-                        occ_valid = np.isfinite(occ_patch) & (occ_patch > 1e-4)
+                        occ_patch = d_clip[y0:y1, :]
+                        occ_valid = np.isfinite(occ_patch)
                         occ_ratio = (
                             float(np.mean((occ_patch[occ_valid] < float(args.v33b_clearance_m)).astype(np.float32)))
                             if occ_valid.any()
                             else 1.0
                         )
-                        if step == 0 or blocked:
+                        is_forward_like = int(base_action) == 1
+                        if not is_forward_like:
                             print(
-                                f"[V33B_COSTMAP] ok=1 w={w} h={h} res={float(args.planner_grid_res):.3f} "
-                                f"occ_ratio={occ_ratio:.3f}",
+                                f"[V33B_LOCAL_AVOID] step={step} skip=1 reason=action_not_forward action_in={base_action_name}",
                                 flush=True,
                             )
+                        else:
+                            blocked = bool(
+                                (center_vr < float(args.v33b_min_valid_ratio))
+                                or (center_clr < float(args.v33b_clearance_m))
+                            )
+                            center_clear = bool(
+                                center_vr >= float(args.v33b_min_valid_ratio)
+                                and center_clr >= float(args.v33b_clearance_m) * 1.15
+                            )
+                            if blocked:
+                                v33b_blocked_count += 1
+                            if step == 0 or blocked:
+                                print(
+                                    f"[V33B_COSTMAP] ok=1 w={w} h={h} res={float(args.planner_grid_res):.3f} "
+                                    f"occ_ratio={occ_ratio:.3f}",
+                                    flush=True,
+                                )
+                            vals_win = occ_patch[np.isfinite(occ_patch)]
+                            if vals_win.size > 0 and (step == 0 or blocked):
+                                p20 = float(np.percentile(vals_win, 20))
+                                p50 = float(np.percentile(vals_win, 50))
+                                p80 = float(np.percentile(vals_win, 80))
+                                print(
+                                    f"[V33B_DEPTH_STATS] step={step} valid_ratio={center_vr:.3f} "
+                                    f"p20={p20:.3f} p50={p50:.3f} p80={p80:.3f} "
+                                    f"min={float(np.min(vals_win)):.3f} max={float(np.max(vals_win)):.3f}",
+                                    flush=True,
+                                )
+                                v33b_depth_stats_logged = True
 
-                        if bool(args.v33b_doorway_trigger):
-                            if blocked and int(action) == 1:
-                                if v33b_doorway_hyst > 0 and v33b_doorway_side != 0:
-                                    chosen_side = int(v33b_doorway_side)
+                            if v33b_steer_latch_steps > 0:
+                                if center_clear:
+                                    v33b_steer_latch_steps = 0
+                                    v33b_steer_latch_side = 0
+                                    print("[V33B_STEER_LATCH] release=1", flush=True)
                                 else:
-                                    chosen_side = 1 if float(best_off) > 0.0 else -1 if float(best_off) < 0.0 else 0
-                                    if chosen_side == 0:
-                                        chosen_side = 1
-                                    v33b_doorway_side = chosen_side
-                                    v33b_doorway_hyst = max(1, int(args.v33b_doorway_hyst_steps))
+                                    v33b_steer_latch_steps -= 1
+                                    if int(v33b_steer_latch_side) != 0:
+                                        action = 3 if int(v33b_steer_latch_side) > 0 else 2
+                                        action_name = _action_id_to_name(action)
+                                        recovery_event_labels.append("v33b_steer_latch")
+
+                            if blocked and int(action) == int(base_action):
+                                improvement = float(best_clr - center_clr)
+                                chosen_off = float(best_off)
+                                should_turn = bool(
+                                    abs(chosen_off) >= float(args.v33b_turn_step_deg)
+                                    and improvement >= float(args.v33b_min_improve_m)
+                                )
+                                if bool(args.v33b_doorway_trigger) and should_turn:
+                                    chosen_side = 1 if chosen_off > 0.0 else -1
                                     v33b_doorway_triggers += 1
                                     print(
                                         f"[V33B_DOORWAY] trigger=1 mode=sample_offsets best={float(best_off):.1f}",
                                         flush=True,
                                     )
-                                action = 3 if chosen_side > 0 else 2
-                                action_name = _action_id_to_name(action)
-                                recovery_event_labels.append("v33b_doorway_turn")
-                            elif v33b_doorway_hyst > 0:
-                                v33b_doorway_hyst -= 1
+                                else:
+                                    chosen_side = 1 if chosen_off > 0.0 else -1 if chosen_off < 0.0 else 0
+                                if should_turn and chosen_side != 0:
+                                    action = 3 if chosen_side > 0 else 2
+                                    action_name = _action_id_to_name(action)
+                                    recovery_event_labels.append("v33b_local_avoid")
+                                    v33b_steer_latch_side = int(chosen_side)
+                                    v33b_steer_latch_steps = max(1, int(args.v33b_steer_hyst_steps))
+                                    side_s = "right" if chosen_side > 0 else "left"
+                                    print(
+                                        f"[V33B_STEER_LATCH] set=1 side={side_s} steps={int(v33b_steer_latch_steps)}",
+                                        flush=True,
+                                    )
 
-                        if blocked and int(base_action) == 1 and int(action) == int(base_action):
-                            chosen_off = float(best_off)
-                            if abs(chosen_off) >= float(args.v33b_turn_step_deg):
-                                action = 3 if chosen_off > 0.0 else 2
-                                action_name = _action_id_to_name(action)
-                                recovery_event_labels.append("v33b_local_avoid")
-                        if int(action) != int(base_action):
-                            v33b_override_count += 1
+                            if int(action) != int(base_action):
+                                v33b_override_count += 1
 
-                        print(
-                            f"[V33B_LOCAL_AVOID] step={step} blocked={int(blocked)} "
-                            f"chosen_offset={float(best_off):.1f} clearance={float(best_clr):.3f} "
-                            f"action_in={base_action_name} action_out={action_name}",
-                            flush=True,
-                        )
+                            print(
+                                f"[V33B_LOCAL_AVOID] step={step} blocked={int(blocked)} "
+                                f"chosen_offset={float(best_off):.1f} clearance={float(best_clr):.3f} "
+                                f"action_in={base_action_name} action_out={action_name}",
+                                flush=True,
+                            )
 
             prev_pos = np.array([obs.pose.x, obs.pose.y, obs.pose.z], dtype=np.float32)
             obs_next, env_done, info = backend.step(int(action))
@@ -1211,15 +1250,17 @@ def main() -> None:
         default=float(os.environ.get("V33B_MIN_VALID_RATIO", "0.30")),
     )
     ap.add_argument("--v33b_strip_w_frac", type=float, default=float(os.environ.get("V33B_STRIP_W_FRAC", "0.08")))
-    ap.add_argument("--v33b_strip_y0_frac", type=float, default=float(os.environ.get("V33B_STRIP_Y0_FRAC", "0.35")))
-    ap.add_argument("--v33b_strip_y1_frac", type=float, default=float(os.environ.get("V33B_STRIP_Y1_FRAC", "0.95")))
+    ap.add_argument("--v33b_strip_y0_frac", type=float, default=float(os.environ.get("V33B_STRIP_Y0_FRAC", "0.25")))
+    ap.add_argument("--v33b_strip_y1_frac", type=float, default=float(os.environ.get("V33B_STRIP_Y1_FRAC", "0.85")))
     ap.add_argument(
         "--v33b_offsets_deg",
         type=str,
         default=str(os.environ.get("V33B_OFFSETS_DEG", "0,10,20,30,-10,-20,-30")),
     )
-    ap.add_argument("--v33b_block_pctl", type=float, default=float(os.environ.get("V33B_BLOCK_PCTL", "5")))
+    ap.add_argument("--v33b_block_pctl", type=float, default=float(os.environ.get("V33B_BLOCK_PCTL", "20")))
     ap.add_argument("--v33b_turn_step_deg", type=float, default=float(os.environ.get("V33B_TURN_STEP_DEG", "15")))
+    ap.add_argument("--v33b_min_improve_m", type=float, default=float(os.environ.get("V33B_MIN_IMPROVE_M", "0.10")))
+    ap.add_argument("--v33b_steer_hyst_steps", type=int, default=int(os.environ.get("V33B_STEER_HYST_STEPS", "5")))
     ap.add_argument("--v33b_doorway_trigger", type=int, default=int(os.environ.get("V33B_DOORWAY_TRIGGER", "1")))
     ap.add_argument(
         "--v33b_doorway_hyst_steps",
