@@ -106,38 +106,63 @@ def _action_id_to_name(action_id: int) -> str:
     return {0: "STOP", 1: "FORWARD", 2: "LEFT", 3: "RIGHT"}.get(int(action_id), "UNKNOWN")
 
 
-def _extract_depth_frame(obs: Any, backend: SimBackend) -> Tuple[Optional[np.ndarray], str]:
-    # Priority order: observation payload first, backend getter fallback.
+def _collect_depth_candidates(obs: Any, backend: SimBackend) -> List[Tuple[str, np.ndarray]]:
+    candidates: List[Tuple[str, np.ndarray]] = []
     depth_obj = getattr(obs, "depth", None)
     if depth_obj is not None:
         try:
             d = np.asarray(depth_obj, dtype=np.float32)
             if d.ndim == 3:
                 d = d[..., 0]
-            return d, "obs.depth"
+            if d.ndim == 2 and d.size > 0:
+                candidates.append(("obs.depth", d))
         except Exception:
             pass
     info = getattr(obs, "info", {}) if hasattr(obs, "info") else {}
     if isinstance(info, dict):
         for key in ("depth", "camera_depth", "depth_m", "depth_frame"):
-            if key in info and info[key] is not None:
-                try:
-                    d = np.asarray(info[key], dtype=np.float32)
-                    if d.ndim == 3:
-                        d = d[..., 0]
-                    return d, f"obs.info.{key}"
-                except Exception:
-                    continue
+            if key not in info or info[key] is None:
+                continue
+            try:
+                d = np.asarray(info[key], dtype=np.float32)
+                if d.ndim == 3:
+                    d = d[..., 0]
+                if d.ndim == 2 and d.size > 0:
+                    candidates.append((f"obs.info.{key}", d))
+            except Exception:
+                continue
     try:
         d2 = backend.get_depth()
         if d2 is not None:
             d = np.asarray(d2, dtype=np.float32)
             if d.ndim == 3:
                 d = d[..., 0]
-            return d, "backend.get_depth"
+            if d.ndim == 2 and d.size > 0:
+                candidates.append(("backend.get_depth", d))
     except Exception:
         pass
-    return None, ""
+    # stable order + dedup by key
+    out: List[Tuple[str, np.ndarray]] = []
+    seen = set()
+    for k, v in candidates:
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append((k, v))
+    return out
+
+
+def _extract_depth_frame(obs: Any, backend: SimBackend, preferred_key: str = "") -> Tuple[Optional[np.ndarray], str]:
+    candidates = _collect_depth_candidates(obs=obs, backend=backend)
+    if len(candidates) == 0:
+        return None, ""
+    pref = str(preferred_key or "").strip()
+    if pref:
+        for key, arr in candidates:
+            if key == pref or key.endswith(pref):
+                return arr, key
+    key, arr = candidates[0]
+    return arr, key
 
 
 def _depth_strip_clearance(
@@ -532,17 +557,22 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
     v33b_far = float(camera_info.get("camera_far", 50.0)) if isinstance(camera_info, dict) else 50.0
     v33b_steer_latch_side = 0
     v33b_steer_latch_steps = 0
+    v33b_depth_key_req = str(os.environ.get("V33B_DEPTH_KEY", "")).strip()
+    v33b_depth_key_used = ""
     v33b_depth_prev_roi: Optional[np.ndarray] = None
     v33b_depth_stale_delta_streak = 0
     v33b_depth_same_stats_k = 0
     v33b_depth_prev_blocked_stats: Optional[Tuple[float, float, float]] = None
     v33b_depth_unreliable = False
+    v33b_depth_hash_prev = ""
+    v33b_depth_hash_repeat = 0
+    v33b_rgb_hash_prev = ""
     v33b_collision_hist: Deque[int] = collections.deque(maxlen=6)
     v33b_probe_failures = 0
     if v33b_enabled:
         print(
             f"[V33B_CFG] enable=1 require_depth={int(args.v33b_require_depth)} clearance_m={float(args.v33b_clearance_m):.2f} "
-            f"offsets={v33b_offsets} doorway={int(args.v33b_doorway_trigger)}",
+            f"offsets={v33b_offsets} doorway={int(args.v33b_doorway_trigger)} depth_key={v33b_depth_key_req or 'auto'}",
             flush=True,
         )
     dist_trace: Deque[float] = collections.deque(maxlen=max(3, int(args.stall_window)))
@@ -769,7 +799,23 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
 
             # v33b: depth/costmap local avoidance as an action filter.
             if v33b_enabled and not v33b_depth_disabled:
-                depth_frame, depth_source = _extract_depth_frame(obs, backend)
+                if step == 0:
+                    cands = _collect_depth_candidates(obs=obs, backend=backend)
+                    key_desc: List[str] = []
+                    for key, arr in cands:
+                        aa = np.asarray(arr, dtype=np.float32)
+                        valid = np.isfinite(aa)
+                        if valid.any():
+                            min_v = float(np.min(aa[valid]))
+                            max_v = float(np.max(aa[valid]))
+                            mean_v = float(np.mean(aa[valid]))
+                        else:
+                            min_v = max_v = mean_v = float("nan")
+                        key_desc.append(
+                            f"{key}:shape={list(aa.shape)} dtype={aa.dtype} min={min_v:.4f} max={max_v:.4f} mean={mean_v:.4f}"
+                        )
+                    print(f"[V33B_DEPTH_KEYS] keys={key_desc}", flush=True)
+                depth_frame, depth_source = _extract_depth_frame(obs, backend, preferred_key=v33b_depth_key_req)
                 if depth_frame is None:
                     if not v33b_depth_caps_logged:
                         print(
@@ -792,6 +838,7 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                         d = d[..., 0]
                     v33b_depth_ready = True
                     v33b_depth_source = str(depth_source)
+                    v33b_depth_key_used = str(depth_source)
                     if (not v33b_depth_caps_logged) and d.ndim == 2:
                         print(
                             f"[V33B_CAPS] depth=1 h={int(d.shape[0])} w={int(d.shape[1])} "
@@ -799,6 +846,37 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                             flush=True,
                         )
                         v33b_depth_caps_logged = True
+                    if (not v33b_depth_disabled) and d.ndim == 2 and d.size > 0:
+                        rgb_md5 = hashlib.md5(np.ascontiguousarray(rgb).tobytes()).hexdigest()
+                        depth_md5 = hashlib.md5(np.ascontiguousarray(d).tobytes()).hexdigest()
+                        if depth_md5 == v33b_depth_hash_prev:
+                            v33b_depth_hash_repeat += 1
+                        else:
+                            v33b_depth_hash_repeat = 0
+                        v33b_depth_hash_prev = depth_md5
+                        v33b_rgb_hash_prev = rgb_md5
+                        if step % 10 == 0:
+                            print(
+                                f"[V33B_OBS_HASH] step={step} rgb_md5={rgb_md5} depth_md5={depth_md5}",
+                                flush=True,
+                            )
+                        if v33b_depth_hash_repeat >= 10:
+                            v33b_depth_unreliable = True
+                            v33b_depth_disabled = True
+                            print("[V33B_CAPS] depth=0 reason=depth_stale_or_invalid", flush=True)
+                            if bool(args.v33b_require_depth):
+                                fail_reason = "backend_caps_depth_stale"
+                                terminated_by = "early_stop"
+                                print(
+                                    f"[TOPO_NAV_FAIL] reason={fail_reason} steps={step}",
+                                    flush=True,
+                                )
+                                break
+                            print(
+                                f"[V33B_LOCAL_AVOID] step={step} skip=1 blocked=0 override=0 "
+                                f"reason=depth_stale_or_invalid action_in={base_action_name} action_out={action_name}",
+                                flush=True,
+                            )
                     if d.ndim == 2 and d.size > 0:
                         h, w = int(d.shape[0]), int(d.shape[1])
                         y0 = int(np.clip(float(args.v33b_strip_y0_frac) * h, 0, max(0, h - 1)))
@@ -1190,6 +1268,8 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             "depth_ready": int(v33b_depth_ready),
             "depth_disabled": int(v33b_depth_disabled),
             "depth_source": str(v33b_depth_source),
+            "depth_key_requested": str(v33b_depth_key_req),
+            "depth_key_used": str(v33b_depth_key_used),
             "blocked_detected_count": int(v33b_blocked_detected_count),
             "override_count": int(v33b_override_count),
             "blocked_no_override_count": int(v33b_blocked_no_override_count),
@@ -1202,9 +1282,11 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             "blocked_forward_reasons": {
                 str(k): int(v) for k, v in sorted(v33b_blocked_forward_reasons.items())
             },
+            "depth_stale_or_invalid": int(v33b_depth_unreliable),
             "depth_unreliable": int(v33b_depth_unreliable),
             "depth_stale_delta_streak": int(v33b_depth_stale_delta_streak),
             "depth_same_stats_k": int(v33b_depth_same_stats_k),
+            "depth_hash_repeat": int(v33b_depth_hash_repeat),
             "forward_probe_failures": int(v33b_probe_failures),
             "doorway_triggers": int(v33b_doorway_triggers),
         },

@@ -780,6 +780,8 @@ def main() -> int:
             blocked_forward_reasons = result_v33b.get("blocked_forward_reasons", blocked_no_override_reasons)
             if not isinstance(blocked_forward_reasons, dict):
                 blocked_forward_reasons = {}
+            depth_key_used = str(result_v33b.get("depth_key_used", "") or "")
+            depth_stale_flag = int(result_v33b.get("depth_stale_or_invalid", 0) or 0)
 
             if goal_type == "room":
                 room_ok, room_metrics = is_room_success_from_trace(trace_rows, g)
@@ -877,6 +879,8 @@ def main() -> int:
                 "v33b_blocked_forward_reasons": {
                     str(k): int(v) for k, v in sorted(blocked_forward_reasons.items())
                 },
+                "v33b_depth_stale_or_invalid": depth_stale_flag,
+                "v33b_depth_key_used": depth_key_used,
                 "v33b_doorway_trigger_count": doorway_trigger_count,
                 "v33b_caps_depth0": int(v33b_stats.get("caps_depth0", 0)),
             }
@@ -930,6 +934,8 @@ def main() -> int:
     )
     v33b_doorway_total = int(sum(int(r.get("v33b_doorway_trigger_count", 0) or 0) for r in records))
     v33b_depth_missing = int(sum(int(r.get("v33b_caps_depth0", 0) or 0) for r in records))
+    v33b_depth_stale_runs = int(sum(1 for r in records if int(r.get("v33b_depth_stale_or_invalid", 0) or 0) > 0))
+    v33b_depth_key_counter = Counter(str(r.get("v33b_depth_key_used", "") or "unset") for r in records)
     v33b_no_override_reasons = Counter()
     for r in records:
         reasons = r.get("v33b_blocked_no_override_reasons", {})
@@ -981,6 +987,8 @@ def main() -> int:
             "blocked_forward_reasons": dict(sorted(v33b_forward_reasons.items())),
             "doorway_triggers_total": v33b_doorway_total,
             "depth_caps_missing_runs": v33b_depth_missing,
+            "depth_stale_runs": v33b_depth_stale_runs,
+            "depth_key_used": dict(sorted(v33b_depth_key_counter.items())),
         },
         "small_mode": int(bool(args.small)),
         "paths": {
@@ -1018,7 +1026,8 @@ def main() -> int:
         f"blocked_forward_overridden={v33b_blocked_forward_overridden_total} "
         f"blocked_forward_pass_through={v33b_blocked_forward_pass_total} "
         f"blocked_forward_reasons=\"{','.join(f'{k}:{v}' for k, v in sorted(v33b_forward_reasons.items()))}\" "
-        f"doorway_triggers={v33b_doorway_total} depth_caps_missing_runs={v33b_depth_missing}"
+        f"doorway_triggers={v33b_doorway_total} depth_caps_missing_runs={v33b_depth_missing} "
+        f"depth_stale_runs={v33b_depth_stale_runs} depth_key_used=\"{','.join(f'{k}:{v}' for k, v in sorted(v33b_depth_key_counter.items()))}\""
     )
     print(v33a_anchor, flush=True)
     print(v33b_anchor, flush=True)

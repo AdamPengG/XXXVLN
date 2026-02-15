@@ -73,6 +73,11 @@ PY
 echo "[V33B_SUITE] start=$(date -Iseconds) baseline_cfg=${RUNTIME_CFG_BASE} v33b_cfg=${RUNTIME_CFG_V33B} small=${SMALL_ARG:-0}" | tee -a "${MASTER_LOG}"
 python3 scripts/gpu/gpu_router.py --role isaac --output anchors | tee -a "${MASTER_LOG}"
 
+# Depth fidelity gate (must pass before v33b A/B).
+(
+  bash scripts/isaac/depth_fidelity_v33b4.sh
+) 2>&1 | tee -a "${MASTER_LOG}"
+
 # Baseline (same runtime config, v33b disabled)
 (
   export ISAAC_ENABLE_DEPTH="${ISAAC_ENABLE_DEPTH:-1}"
@@ -143,6 +148,27 @@ print(
     f"baseline=success:{int(base.get('success', 0))},max_steps:{c(base,'max_steps')},stuck:{c(base,'stuck')},invalid_goal:{c(base,'invalid_goal')} "
     f"vs v33b=success:{int(new.get('success', 0))},max_steps:{c(new,'max_steps')},stuck:{c(new,'stuck')},invalid_goal:{c(new,'invalid_goal')}"
 )
+depth_key_used = "unset"
+v33b = new.get("v33b", {}) if isinstance(new.get("v33b", {}), dict) else {}
+dk = v33b.get("depth_key_used", {})
+if isinstance(dk, dict) and len(dk) > 0:
+    depth_key_used = ",".join(f"{k}:{v}" for k, v in sorted(dk.items()))
+print(f"[V33B_DEPTH_KEY] used={depth_key_used}")
 PY
 
-echo "[V33B_SUITE_OK] baseline_root=${BASELINE_ROOT} v33b_root=${V33B_ROOT} baseline_summary=${BASELINE_ROOT}/summary.json v33b_summary=${V33B_ROOT}/summary.json v33b_cards=${V33B_ROOT}/failure_cards/index.html" | tee -a "${MASTER_LOG}"
+DEPTH_KEY_USED="$(python3 - "${V33B_ROOT}/summary.json" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+if not p.exists():
+    print("unset")
+    raise SystemExit(0)
+obj = json.loads(p.read_text(encoding='utf-8'))
+v = obj.get("v33b", {}) if isinstance(obj.get("v33b", {}), dict) else {}
+dk = v.get("depth_key_used", {})
+if isinstance(dk, dict) and len(dk) > 0:
+    print(",".join(f"{k}:{v}" for k, v in sorted(dk.items())))
+else:
+    print("unset")
+PY
+)"
+echo "[V33B_SUITE_OK] baseline_root=${BASELINE_ROOT} v33b_root=${V33B_ROOT} baseline_summary=${BASELINE_ROOT}/summary.json v33b_summary=${V33B_ROOT}/summary.json v33b_cards=${V33B_ROOT}/failure_cards/index.html depth_key_used=${DEPTH_KEY_USED}" | tee -a "${MASTER_LOG}"
