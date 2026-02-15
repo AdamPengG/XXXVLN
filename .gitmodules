@@ -1,0 +1,4 @@
+[submodule "repo/InternNav"]
+	path = repo/InternNav
+	url = git@github.com:AdamPengG/XXXVLN.git
+	branch = feat/xxxvln-v27-v28-internnav
