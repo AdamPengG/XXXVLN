@@ -258,6 +258,29 @@ def _parse_v33a_log(log_path: Path) -> Dict[str, int]:
     return out
 
 
+def _parse_v33b_log(log_path: Path) -> Dict[str, int]:
+    out = {"blocked": 0, "overrides": 0, "doorway": 0, "caps_depth0": 0}
+    if not log_path.exists():
+        return out
+    for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if "[V33B_LOCAL_AVOID]" in line:
+            if "blocked=1" in line:
+                out["blocked"] += 1
+            if "action_in=" in line and "action_out=" in line:
+                try:
+                    ain = line.split("action_in=", 1)[1].split()[0].strip()
+                    aout = line.split("action_out=", 1)[1].split()[0].strip()
+                    if ain != aout:
+                        out["overrides"] += 1
+                except Exception:
+                    pass
+        if "[V33B_DOORWAY]" in line and "trigger=1" in line:
+            out["doorway"] += 1
+        if "[V33B_CAPS]" in line and "depth=0" in line:
+            out["caps_depth0"] += 1
+    return out
+
+
 def _classify_fail(
     result: Optional[Dict[str, Any]],
     timed_out: bool,
@@ -280,6 +303,8 @@ def _classify_fail(
 
     if "stuck" in fail_reason.lower():
         return "stuck", fail_reason
+    if "backend_caps" in fail_reason.lower():
+        return "backend_caps", fail_reason
     if "room_settle_not_met" in fail_reason:
         return "max_steps", fail_reason
     if "invalid_goal" in fail_reason:
@@ -318,6 +343,10 @@ def _write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         "v33a_stuck_triggers",
         "v33a_recovery_count",
         "v33a_recovery_giveup",
+        "v33b_blocked_count",
+        "v33b_override_count",
+        "v33b_doorway_trigger_count",
+        "v33b_caps_depth0",
         "log_path",
         "debug_index",
     ]
@@ -575,6 +604,10 @@ def main() -> int:
                     "v33a_stuck_triggers": 0,
                     "v33a_recovery_count": 0,
                     "v33a_recovery_giveup": 0,
+                    "v33b_blocked_count": 0,
+                    "v33b_override_count": 0,
+                    "v33b_doorway_trigger_count": 0,
+                    "v33b_caps_depth0": 0,
                 }
                 with log_path.open("w", encoding="utf-8") as lf:
                     lf.write(f"# run_id={run_id}\n")
@@ -695,9 +728,12 @@ def main() -> int:
             trace_rows = _load_trace_rows(debug_run_dir / "trace.jsonl")
             trace_stats = _load_trace_stats(debug_run_dir)
             v33a_stats = _parse_v33a_log(log_path)
+            v33b_stats = _parse_v33b_log(log_path)
             fail_type, reason = _classify_fail(result=result, timed_out=timed_out, exit_code=exit_code, trace_stats=trace_stats)
             if fail_type == "unknown" and int(v33a_stats.get("giveup", 0)) > 0:
                 fail_type, reason = "stuck", "v33a_recovery_giveup"
+            if fail_type == "unknown" and int(v33b_stats.get("caps_depth0", 0)) > 0:
+                fail_type, reason = "backend_caps", "backend_caps_depth_missing"
 
             success = bool(result.get("success", False)) if isinstance(result, dict) else False
             steps_used = int(result.get("steps_used", 0)) if isinstance(result, dict) else 0
@@ -792,6 +828,10 @@ def main() -> int:
                 "v33a_stuck_triggers": int(v33a_stats.get("stuck_triggers", 0)),
                 "v33a_recovery_count": int(v33a_stats.get("recoveries", 0)),
                 "v33a_recovery_giveup": int(v33a_stats.get("giveup", 0)),
+                "v33b_blocked_count": int(v33b_stats.get("blocked", 0)),
+                "v33b_override_count": int(v33b_stats.get("overrides", 0)),
+                "v33b_doorway_trigger_count": int(v33b_stats.get("doorway", 0)),
+                "v33b_caps_depth0": int(v33b_stats.get("caps_depth0", 0)),
             }
             records.append(rec)
 
@@ -831,6 +871,10 @@ def main() -> int:
     stuck_triggers_total = int(sum(int(r.get("v33a_stuck_triggers", 0) or 0) for r in records))
     recoveries_total = int(sum(int(r.get("v33a_recovery_count", 0) or 0) for r in records))
     stuck_failures = int(sum(1 for r in records if str(r.get("fail_type", "")) == "stuck"))
+    v33b_blocked_total = int(sum(int(r.get("v33b_blocked_count", 0) or 0) for r in records))
+    v33b_override_total = int(sum(int(r.get("v33b_override_count", 0) or 0) for r in records))
+    v33b_doorway_total = int(sum(int(r.get("v33b_doorway_trigger_count", 0) or 0) for r in records))
+    v33b_depth_missing = int(sum(int(r.get("v33b_caps_depth0", 0) or 0) for r in records))
 
     summary = {
         "version": int(goal_catalog_version),
@@ -850,6 +894,12 @@ def main() -> int:
             "stuck_triggers": stuck_triggers_total,
             "recoveries": recoveries_total,
             "stuck_failures": stuck_failures,
+        },
+        "v33b": {
+            "blocked_total": v33b_blocked_total,
+            "overrides_total": v33b_override_total,
+            "doorway_triggers_total": v33b_doorway_total,
+            "depth_caps_missing_runs": v33b_depth_missing,
         },
         "small_mode": int(bool(args.small)),
         "paths": {
@@ -879,7 +929,12 @@ def main() -> int:
         f"[V33A_SUMMARY] stuck_triggers={stuck_triggers_total} "
         f"recoveries={recoveries_total} stuck_failures={stuck_failures}"
     )
+    v33b_anchor = (
+        f"[V33B_SUMMARY] blocked={v33b_blocked_total} overrides={v33b_override_total} "
+        f"doorway_triggers={v33b_doorway_total} depth_caps_missing_runs={v33b_depth_missing}"
+    )
     print(v33a_anchor, flush=True)
+    print(v33b_anchor, flush=True)
     if anchor_tag != "V31_SCALE_EVAL":
         legacy_done = (
             f"[V31_SCALE_EVAL] done runs_total={len(records)} success={success_n} failure={fail_n} "
@@ -901,6 +956,7 @@ def main() -> int:
         f.write(done_anchor + "\n")
         f.write(out_anchor + "\n")
         f.write(v33a_anchor + "\n")
+        f.write(v33b_anchor + "\n")
         if anchor_tag != "V31_SCALE_EVAL":
             f.write(legacy_done + "\n")
             f.write(legacy_out + "\n")

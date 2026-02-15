@@ -79,6 +79,94 @@ def _count_sign_flips(vals: List[float], eps: float) -> int:
     return int(flips)
 
 
+def _parse_offsets_deg(text: str) -> List[float]:
+    vals: List[float] = []
+    for part in str(text).split(","):
+        tok = part.strip()
+        if tok == "":
+            continue
+        try:
+            vals.append(float(tok))
+        except Exception:
+            continue
+    if 0.0 not in vals:
+        vals.insert(0, 0.0)
+    uniq = []
+    seen = set()
+    for v in vals:
+        key = round(float(v), 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(float(v))
+    return uniq if len(uniq) > 0 else [0.0]
+
+
+def _action_id_to_name(action_id: int) -> str:
+    return {0: "STOP", 1: "FORWARD", 2: "LEFT", 3: "RIGHT"}.get(int(action_id), "UNKNOWN")
+
+
+def _extract_depth_frame(obs: Any, backend: SimBackend) -> Tuple[Optional[np.ndarray], str]:
+    # Priority order: observation payload first, backend getter fallback.
+    depth_obj = getattr(obs, "depth", None)
+    if depth_obj is not None:
+        try:
+            d = np.asarray(depth_obj, dtype=np.float32)
+            if d.ndim == 3:
+                d = d[..., 0]
+            return d, "obs.depth"
+        except Exception:
+            pass
+    info = getattr(obs, "info", {}) if hasattr(obs, "info") else {}
+    if isinstance(info, dict):
+        for key in ("depth", "camera_depth", "depth_m", "depth_frame"):
+            if key in info and info[key] is not None:
+                try:
+                    d = np.asarray(info[key], dtype=np.float32)
+                    if d.ndim == 3:
+                        d = d[..., 0]
+                    return d, f"obs.info.{key}"
+                except Exception:
+                    continue
+    try:
+        d2 = backend.get_depth()
+        if d2 is not None:
+            d = np.asarray(d2, dtype=np.float32)
+            if d.ndim == 3:
+                d = d[..., 0]
+            return d, "backend.get_depth"
+    except Exception:
+        pass
+    return None, ""
+
+
+def _depth_strip_clearance(
+    depth: np.ndarray,
+    col_center: int,
+    strip_w: int,
+    y0: int,
+    y1: int,
+    pctl: float,
+    min_valid_ratio: float,
+) -> Tuple[float, float]:
+    h, w = int(depth.shape[0]), int(depth.shape[1])
+    half = max(1, strip_w // 2)
+    x0 = max(0, int(col_center - half))
+    x1 = min(w, int(col_center + half + 1))
+    if y1 <= y0 or x1 <= x0:
+        return 0.0, 0.0
+    patch = depth[y0:y1, x0:x1]
+    if patch.size == 0:
+        return 0.0, 0.0
+    valid = np.isfinite(patch) & (patch > 1e-4)
+    valid_ratio = float(valid.mean())
+    if valid_ratio < float(min_valid_ratio):
+        return 0.0, valid_ratio
+    vals = patch[valid]
+    clearance = float(np.percentile(vals, float(np.clip(pctl, 0.0, 100.0))))
+    return clearance, valid_ratio
+
+
 def _nearest_node(position: np.ndarray, graph: TopoGraph) -> Tuple[int, float]:
     best_id = None
     best_dist = float("inf")
@@ -423,6 +511,25 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
         f"yaw_eps={float(args.oscillation_yaw_eps_deg):.1f}",
         flush=True,
     )
+    v33b_enabled = bool(int(args.v33b_enable))
+    v33b_depth_ready = False
+    v33b_depth_disabled = False
+    v33b_depth_source = ""
+    v33b_depth_caps_logged = False
+    v33b_depth_stats_logged = False
+    v33b_blocked_count = 0
+    v33b_override_count = 0
+    v33b_doorway_triggers = 0
+    v33b_doorway_side = 0
+    v33b_doorway_hyst = 0
+    v33b_offsets = _parse_offsets_deg(args.v33b_offsets_deg)
+    v33b_fov_deg = float(camera_info.get("camera_fov_deg", 90.0)) if isinstance(camera_info, dict) else 90.0
+    if v33b_enabled:
+        print(
+            f"[V33B_CFG] enable=1 require_depth={int(args.v33b_require_depth)} clearance_m={float(args.v33b_clearance_m):.2f} "
+            f"offsets={v33b_offsets} doorway={int(args.v33b_doorway_trigger)}",
+            flush=True,
+        )
     dist_trace: Deque[float] = collections.deque(maxlen=max(3, int(args.stall_window)))
     goal_dist_trace: Deque[float] = collections.deque(maxlen=max(3, int(args.stall_window)))
     stuck_pos_trace: Deque[np.ndarray] = collections.deque(maxlen=max(4, int(args.stuck_window) + 1))
@@ -628,18 +735,147 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
 
             recovery_event_labels: List[str] = []
             if recovery_queue:
-                action = int(recovery_queue.popleft())
-                action_name = "LEFT" if action == 2 else "RIGHT" if action == 3 else "STOP" if action == 0 else "FORWARD"
+                base_action = int(recovery_queue.popleft())
+                base_action_name = _action_id_to_name(base_action)
                 recovery_event_labels.append("v33a_recovery_scan")
             elif args.controller_mode == "follower":
                 if dist <= float(args.stop_thresh):
-                    action, action_name = 0, "STOP"
+                    base_action, base_action_name = 0, "STOP"
                 elif abs(bearing) > turn_thresh_rad * 0.8:
-                    action, action_name = (2, "LEFT") if bearing < 0.0 else (3, "RIGHT")
+                    base_action, base_action_name = (2, "LEFT") if bearing < 0.0 else (3, "RIGHT")
                 else:
-                    action, action_name = 1, "FORWARD"
+                    base_action, base_action_name = 1, "FORWARD"
             else:
-                action, action_name = bearing_ctrl.decide(bearing, dist)
+                base_action, base_action_name = bearing_ctrl.decide(bearing, dist)
+
+            action = int(base_action)
+            action_name = str(base_action_name)
+
+            # v33b: depth/costmap local avoidance as an action filter.
+            if v33b_enabled and not v33b_depth_disabled:
+                depth_frame, depth_source = _extract_depth_frame(obs, backend)
+                if depth_frame is None:
+                    if not v33b_depth_caps_logged:
+                        print(
+                            '[V33B_CAPS] depth=0 reason=no_depth_in_obs hint="set ISAAC_ENABLE_DEPTH=1 or enable depth in backend"',
+                            flush=True,
+                        )
+                        v33b_depth_caps_logged = True
+                    if bool(args.v33b_require_depth):
+                        fail_reason = "backend_caps_depth_missing"
+                        terminated_by = "early_stop"
+                        print(
+                            f"[TOPO_NAV_FAIL] reason={fail_reason} steps={step}",
+                            flush=True,
+                        )
+                        break
+                    v33b_depth_disabled = True
+                else:
+                    d = np.asarray(depth_frame, dtype=np.float32)
+                    if d.ndim == 3:
+                        d = d[..., 0]
+                    v33b_depth_ready = True
+                    v33b_depth_source = str(depth_source)
+                    finite = np.isfinite(d) & (d > 1e-4)
+                    valid_ratio = float(finite.mean()) if d.size > 0 else 0.0
+                    if (not v33b_depth_caps_logged) and d.ndim == 2:
+                        print(
+                            f"[V33B_CAPS] depth=1 h={int(d.shape[0])} w={int(d.shape[1])} "
+                            f"fov_deg={float(v33b_fov_deg):.1f} source=obs_key:{depth_source}",
+                            flush=True,
+                        )
+                        v33b_depth_caps_logged = True
+                    if not v33b_depth_stats_logged and finite.any():
+                        vals = d[finite]
+                        print(
+                            f"[V33B_DEPTH_STATS] valid_ratio={valid_ratio:.3f} "
+                            f"p5={float(np.percentile(vals, 5)):.3f} "
+                            f"p50={float(np.percentile(vals, 50)):.3f} "
+                            f"p95={float(np.percentile(vals, 95)):.3f}",
+                            flush=True,
+                        )
+                        v33b_depth_stats_logged = True
+                    if d.ndim == 2 and d.size > 0:
+                        h, w = int(d.shape[0]), int(d.shape[1])
+                        y0 = int(np.clip(float(args.v33b_strip_y0_frac) * h, 0, max(0, h - 1)))
+                        y1 = int(np.clip(float(args.v33b_strip_y1_frac) * h, y0 + 1, h))
+                        strip_w = max(1, int(float(args.v33b_strip_w_frac) * w))
+
+                        offset_metrics: Dict[float, Tuple[float, float]] = {}
+                        for off in v33b_offsets:
+                            col = int(round((w * 0.5) + (float(off) / max(1e-3, float(v33b_fov_deg))) * w))
+                            clr, vr = _depth_strip_clearance(
+                                d,
+                                col_center=col,
+                                strip_w=strip_w,
+                                y0=y0,
+                                y1=y1,
+                                pctl=float(args.v33b_block_pctl),
+                                min_valid_ratio=float(args.v33b_min_valid_ratio),
+                            )
+                            offset_metrics[float(off)] = (float(clr), float(vr))
+
+                        center_off = min(v33b_offsets, key=lambda x: abs(float(x)))
+                        center_clr, center_vr = offset_metrics.get(float(center_off), (0.0, 0.0))
+                        blocked = bool(
+                            (center_vr < float(args.v33b_min_valid_ratio))
+                            or (center_clr < float(args.v33b_clearance_m))
+                        )
+                        if blocked:
+                            v33b_blocked_count += 1
+
+                        best_off = max(v33b_offsets, key=lambda x: offset_metrics.get(float(x), (0.0, 0.0))[0])
+                        best_clr = offset_metrics.get(float(best_off), (0.0, 0.0))[0]
+                        occ_patch = d[y0:y1, :]
+                        occ_valid = np.isfinite(occ_patch) & (occ_patch > 1e-4)
+                        occ_ratio = (
+                            float(np.mean((occ_patch[occ_valid] < float(args.v33b_clearance_m)).astype(np.float32)))
+                            if occ_valid.any()
+                            else 1.0
+                        )
+                        if step == 0 or blocked:
+                            print(
+                                f"[V33B_COSTMAP] ok=1 w={w} h={h} res={float(args.planner_grid_res):.3f} "
+                                f"occ_ratio={occ_ratio:.3f}",
+                                flush=True,
+                            )
+
+                        if bool(args.v33b_doorway_trigger):
+                            if blocked and int(action) == 1:
+                                if v33b_doorway_hyst > 0 and v33b_doorway_side != 0:
+                                    chosen_side = int(v33b_doorway_side)
+                                else:
+                                    chosen_side = 1 if float(best_off) > 0.0 else -1 if float(best_off) < 0.0 else 0
+                                    if chosen_side == 0:
+                                        chosen_side = 1
+                                    v33b_doorway_side = chosen_side
+                                    v33b_doorway_hyst = max(1, int(args.v33b_doorway_hyst_steps))
+                                    v33b_doorway_triggers += 1
+                                    print(
+                                        f"[V33B_DOORWAY] trigger=1 mode=sample_offsets best={float(best_off):.1f}",
+                                        flush=True,
+                                    )
+                                action = 3 if chosen_side > 0 else 2
+                                action_name = _action_id_to_name(action)
+                                recovery_event_labels.append("v33b_doorway_turn")
+                            elif v33b_doorway_hyst > 0:
+                                v33b_doorway_hyst -= 1
+
+                        if blocked and int(base_action) == 1 and int(action) == int(base_action):
+                            chosen_off = float(best_off)
+                            if abs(chosen_off) >= float(args.v33b_turn_step_deg):
+                                action = 3 if chosen_off > 0.0 else 2
+                                action_name = _action_id_to_name(action)
+                                recovery_event_labels.append("v33b_local_avoid")
+                        if int(action) != int(base_action):
+                            v33b_override_count += 1
+
+                        print(
+                            f"[V33B_LOCAL_AVOID] step={step} blocked={int(blocked)} "
+                            f"chosen_offset={float(best_off):.1f} clearance={float(best_clr):.3f} "
+                            f"action_in={base_action_name} action_out={action_name}",
+                            flush=True,
+                        )
 
             prev_pos = np.array([obs.pose.x, obs.pose.y, obs.pose.z], dtype=np.float32)
             obs_next, env_done, info = backend.step(int(action))
@@ -768,6 +1004,15 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
         "v33a_stuck_trigger_count": int(v33a_stuck_triggers),
         "v33a_recovery_count": int(v33a_recovery_count),
         "v33a_stuck_fail": int(v33a_stuck_fail),
+        "v33b": {
+            "enabled": int(v33b_enabled),
+            "depth_ready": int(v33b_depth_ready),
+            "depth_disabled": int(v33b_depth_disabled),
+            "depth_source": str(v33b_depth_source),
+            "blocked_count": int(v33b_blocked_count),
+            "override_count": int(v33b_override_count),
+            "doorway_triggers": int(v33b_doorway_triggers),
+        },
         "belief_entropy_summary": {
             "mean": float(last_entropy),
             "max": float(last_entropy),
@@ -956,6 +1201,30 @@ def main() -> None:
         "--stuck_max_recoveries",
         type=int,
         default=int(os.environ.get("STUCK_MAX_RECOVERIES", "3")),
+    )
+    ap.add_argument("--v33b_enable", type=int, default=int(os.environ.get("V33B_ENABLE", "0")))
+    ap.add_argument("--v33b_require_depth", type=int, default=int(os.environ.get("V33B_REQUIRE_DEPTH", "1")))
+    ap.add_argument("--v33b_clearance_m", type=float, default=float(os.environ.get("V33B_CLEARANCE_M", "0.65")))
+    ap.add_argument(
+        "--v33b_min_valid_ratio",
+        type=float,
+        default=float(os.environ.get("V33B_MIN_VALID_RATIO", "0.30")),
+    )
+    ap.add_argument("--v33b_strip_w_frac", type=float, default=float(os.environ.get("V33B_STRIP_W_FRAC", "0.08")))
+    ap.add_argument("--v33b_strip_y0_frac", type=float, default=float(os.environ.get("V33B_STRIP_Y0_FRAC", "0.35")))
+    ap.add_argument("--v33b_strip_y1_frac", type=float, default=float(os.environ.get("V33B_STRIP_Y1_FRAC", "0.95")))
+    ap.add_argument(
+        "--v33b_offsets_deg",
+        type=str,
+        default=str(os.environ.get("V33B_OFFSETS_DEG", "0,10,20,30,-10,-20,-30")),
+    )
+    ap.add_argument("--v33b_block_pctl", type=float, default=float(os.environ.get("V33B_BLOCK_PCTL", "5")))
+    ap.add_argument("--v33b_turn_step_deg", type=float, default=float(os.environ.get("V33B_TURN_STEP_DEG", "15")))
+    ap.add_argument("--v33b_doorway_trigger", type=int, default=int(os.environ.get("V33B_DOORWAY_TRIGGER", "1")))
+    ap.add_argument(
+        "--v33b_doorway_hyst_steps",
+        type=int,
+        default=int(os.environ.get("V33B_DOORWAY_HYST_STEPS", "8")),
     )
     ap.add_argument("--stop_near_m", type=float, default=1.25)
     ap.add_argument("--stop_near_goal_score_min", type=float, default=0.05)
