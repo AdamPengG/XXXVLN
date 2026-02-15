@@ -1,7 +1,0 @@
-configs/isaac_scenes_v23.yaml
-repo/InternNav/internnav/sim_backend/isaac_backend.py
-repo/InternNav/internnav/topo/debug_capture.py
-scripts/topo_backend_runner.py
-scripts/topo_eval_suite_v23_isaac.sh
-scripts/topo_isaac_sanity_check.py
-scripts/package_topo_mvp_proof_v23_isaac.sh

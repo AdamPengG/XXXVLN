@@ -1,4 +1,0 @@
-# v23 isaac suite
-bash scripts/topo_eval_suite_v23_isaac.sh
-# package proof
-bash scripts/package_topo_mvp_proof_v23_isaac.sh

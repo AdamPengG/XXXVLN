@@ -19,6 +19,9 @@ __pycache__/
 # Local data/output
 runs/
 checkpoints/
+forGPT/
+weights/
+secrets/
 forGPT/**/topo_mvp_PROOF_*.zip
 forGPT/**/*.zip
 *.zip
@@ -40,3 +43,5 @@ forGPT/**/*.zip
 
 # OS
 .DS_Store
+IsaacAssets/
+**/OfficeCollected/

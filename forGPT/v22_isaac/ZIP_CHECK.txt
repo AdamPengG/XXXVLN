@@ -1,1 +1,0 @@
-[ZIP_CHECK_OK] bad_count=0 path=/home/peng/DualVLN/forGPT/v22_isaac/ZIP_CHECK.txt

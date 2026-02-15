@@ -1,3 +1,0 @@
-cd /home/peng/DualVLN
-bash scripts/topo_eval_suite_v24_isaac.sh
-bash scripts/package_topo_mvp_proof_v24_isaac.sh
