@@ -1,0 +1,17 @@
+version: 34
+assets_root: /home/peng/isaacsim_assets
+scene: office_localized
+goals:
+  - id: office_pose_v34a_goal_001
+    type: pose
+    value:
+      x: -2.8
+      z: -2.5
+      yaw_deg: 25.0
+    success:
+      dist_m: 0.50
+      yaw_deg: 15
+    meta:
+      bucket: easy
+      aliases: ["front_desk_left"]
+      note: "v34a baseline/dualvln A-B pose goal"

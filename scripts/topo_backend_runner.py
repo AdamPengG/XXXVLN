@@ -2,15 +2,21 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import collections
 import hashlib
+import io
 import json
 import math
 import os
 import time
+import urllib.error
+import urllib.request
+import zlib
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
+from PIL import Image
 
 from internnav.sim_backend.base import SimBackend
 from internnav.topo.controller import BearingController
@@ -104,6 +110,92 @@ def _parse_offsets_deg(text: str) -> List[float]:
 
 def _action_id_to_name(action_id: int) -> str:
     return {0: "STOP", 1: "FORWARD", 2: "LEFT", 3: "RIGHT"}.get(int(action_id), "UNKNOWN")
+
+
+def _action_name_to_id(action_name: str) -> Optional[int]:
+    tok = str(action_name or "").strip().upper()
+    mapping = {
+        "STOP": 0,
+        "FORWARD": 1,
+        "FWD": 1,
+        "LEFT": 2,
+        "RIGHT": 3,
+    }
+    return mapping.get(tok, None)
+
+
+def _encode_rgb_jpeg_b64(rgb: np.ndarray, quality: int = 85) -> Tuple[str, int]:
+    arr = np.asarray(rgb, dtype=np.uint8)
+    img = Image.fromarray(arr)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=int(np.clip(quality, 40, 95)))
+    raw = buf.getvalue()
+    return base64.b64encode(raw).decode("utf-8"), int(len(raw))
+
+
+def _encode_depth_f16_zlib_b64(depth: Optional[np.ndarray]) -> Tuple[str, int, Optional[List[int]]]:
+    if depth is None:
+        return "", 0, None
+    d = np.asarray(depth, dtype=np.float32)
+    if d.ndim == 3:
+        d = d[..., 0]
+    if d.ndim != 2 or d.size == 0:
+        return "", 0, None
+    d16 = d.astype(np.float16)
+    raw = d16.tobytes(order="C")
+    comp = zlib.compress(raw, level=3)
+    return base64.b64encode(comp).decode("utf-8"), int(len(comp)), [int(d.shape[0]), int(d.shape[1])]
+
+
+class DualVlnRpcClient:
+    def __init__(self, server_url: str, timeout_s: float = 5.0, fallback_action: str = "topo") -> None:
+        self.server_url = str(server_url).rstrip("/")
+        self.timeout_s = float(timeout_s)
+        self.fallback_action = str(fallback_action).strip().lower()
+
+    def infer(
+        self,
+        rgb: np.ndarray,
+        depth: Optional[np.ndarray],
+        pose: Dict[str, float],
+        instruction: str,
+        intrinsics: Dict[str, Any],
+    ) -> Tuple[bool, str, float, str, int, int]:
+        rgb_b64, rgb_bytes = _encode_rgb_jpeg_b64(rgb)
+        depth_b64, depth_bytes, depth_shape = _encode_depth_f16_zlib_b64(depth)
+        payload = {
+            "rgb_jpeg_b64": rgb_b64,
+            "depth_f16_zlib_b64": depth_b64,
+            "depth_shape": depth_shape,
+            "pose": pose,
+            "instruction": str(instruction),
+            "intrinsics": intrinsics,
+        }
+        req = urllib.request.Request(
+            url=f"{self.server_url}/infer",
+            method="POST",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                raw = resp.read()
+            obj = json.loads(raw.decode("utf-8"))
+            if int(obj.get("ok", 0)) != 1:
+                return False, "server_ok0", float((time.time() - t0) * 1000.0), "", rgb_bytes, depth_bytes
+            action = str(obj.get("action", "") or "").strip().upper()
+            if _action_name_to_id(action) is None:
+                return False, f"invalid_action:{action}", float((time.time() - t0) * 1000.0), "", rgb_bytes, depth_bytes
+            latency_ms = float(obj.get("extra", {}).get("latency_ms", float((time.time() - t0) * 1000.0)))
+            return True, "", float(latency_ms), action, rgb_bytes, depth_bytes
+        except urllib.error.HTTPError as e:
+            return False, f"http_error:{e.code}", float((time.time() - t0) * 1000.0), "", rgb_bytes, depth_bytes
+        except urllib.error.URLError as e:
+            rsn = getattr(e, "reason", e)
+            return False, f"url_error:{rsn}", float((time.time() - t0) * 1000.0), "", rgb_bytes, depth_bytes
+        except Exception as e:
+            return False, f"{type(e).__name__}:{e}", float((time.time() - t0) * 1000.0), "", rgb_bytes, depth_bytes
 
 
 def _collect_depth_candidates(obs: Any, backend: SimBackend) -> List[Tuple[str, np.ndarray]]:
@@ -443,6 +535,28 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             camera_info = dict(getattr(backend, "get_camera_info")())
         except Exception:
             camera_info = {}
+    planb_policy = str(getattr(args, "planb_policy", "topo")).strip().lower()
+    if planb_policy not in {"topo", "dualvln_rpc"}:
+        planb_policy = "topo"
+    rpc_client: Optional[DualVlnRpcClient] = None
+    rpc_fallback = str(getattr(args, "dualvln_rpc_fallback", "topo")).strip().lower()
+    rpc_failures = 0
+    rpc_successes = 0
+    if planb_policy == "dualvln_rpc":
+        rpc_client = DualVlnRpcClient(
+            server_url=str(args.dualvln_server_url),
+            timeout_s=float(args.dualvln_rpc_timeout_s),
+            fallback_action=rpc_fallback,
+        )
+        isaac_gpu = str(os.environ.get("ISAAC_GPU_ID", os.environ.get("CUDA_VISIBLE_DEVICES", "unknown")))
+        dual_gpu = str(os.environ.get("DUALVLN_SERVER_GPU_ID", "1"))
+        print(
+            f"[PLANB_POLICY] name=dualvln_rpc ok=1 server={str(args.dualvln_server_url)} timeout_s={float(args.dualvln_rpc_timeout_s):.2f}",
+            flush=True,
+        )
+        print(f"[GPU_SPLIT] isaac_gpu={isaac_gpu} dualvln_gpu={dual_gpu}", flush=True)
+    else:
+        print(f"[PLANB_POLICY] name=topo ok=1", flush=True)
 
     goal_pos = np.array(graph.nodes[goal_node].position, dtype=np.float32)
     if goal_pose_override is not None:
@@ -802,6 +916,48 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                     base_action, base_action_name = 1, "FORWARD"
             else:
                 base_action, base_action_name = bearing_ctrl.decide(bearing, dist)
+
+            if planb_policy == "dualvln_rpc" and rpc_client is not None and "v33a_recovery_scan" not in recovery_event_labels:
+                pose_payload = {
+                    "x": float(obs.pose.x),
+                    "y": float(obs.pose.y),
+                    "z": float(obs.pose.z),
+                    "yaw_deg": float(math.degrees(float(obs.pose.yaw))),
+                    "frame": "world_xzyaw_deg",
+                }
+                intrinsics = {
+                    "w": int(camera_info.get("camera_w", rgb.shape[1])) if isinstance(camera_info, dict) else int(rgb.shape[1]),
+                    "h": int(camera_info.get("camera_h", rgb.shape[0])) if isinstance(camera_info, dict) else int(rgb.shape[0]),
+                    "fov_deg": float(camera_info.get("camera_fov_deg", 90.0)) if isinstance(camera_info, dict) else 90.0,
+                }
+                ok_rpc, rpc_reason, rpc_latency_ms, rpc_action_name, rgb_bytes, depth_bytes = rpc_client.infer(
+                    rgb=rgb,
+                    depth=depth,
+                    pose=pose_payload,
+                    instruction=str(args.query),
+                    intrinsics=intrinsics,
+                )
+                if ok_rpc:
+                    rpc_successes += 1
+                    rpc_action_id = _action_name_to_id(rpc_action_name)
+                    if rpc_action_id is not None:
+                        base_action = int(rpc_action_id)
+                        base_action_name = _action_id_to_name(base_action)
+                    print(
+                        f"[DUALVLN_RPC] ok=1 step={step} latency_ms={rpc_latency_ms:.2f} action={base_action_name} "
+                        f"rgb_bytes={int(rgb_bytes)} depth_bytes={int(depth_bytes)}",
+                        flush=True,
+                    )
+                else:
+                    rpc_failures += 1
+                    if rpc_fallback == "stop":
+                        base_action = 0
+                        base_action_name = "STOP"
+                    fallback_action_name = base_action_name
+                    print(
+                        f"[DUALVLN_RPC] ok=0 step={step} reason={rpc_reason} fallback_action={fallback_action_name}",
+                        flush=True,
+                    )
 
             action = int(base_action)
             action_name = str(base_action_name)
@@ -1345,6 +1501,13 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             "forward_probe_failures": int(v33b_probe_failures),
             "doorway_triggers": int(v33b_doorway_triggers),
         },
+        "policy": {
+            "name": str(planb_policy),
+            "rpc_server_url": str(args.dualvln_server_url) if planb_policy == "dualvln_rpc" else "",
+            "rpc_successes": int(rpc_successes),
+            "rpc_failures": int(rpc_failures),
+            "rpc_fallback": str(rpc_fallback),
+        },
         "belief_entropy_summary": {
             "mean": float(last_entropy),
             "max": float(last_entropy),
@@ -1415,6 +1578,8 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             "goal_node": int(goal_node),
             "goal_score": float(goal_score),
             "settings": {
+                "planb_policy": str(planb_policy),
+                "dualvln_server_url": str(args.dualvln_server_url) if planb_policy == "dualvln_rpc" else "",
                 "debug_only_on_fail": int(bool(args.debug_only_on_fail)),
                 "debug_frame_stride": int(args.debug_frame_stride),
                 "debug_ringbuf_steps": int(args.debug_ringbuf_steps),
@@ -1490,6 +1655,28 @@ def main() -> None:
         default=int(os.environ.get("TOPO_BACKEND_SIMPLE_EMBED_DIM", "64")),
     )
     ap.add_argument("--vision_prompt", type=str, default="")
+    ap.add_argument(
+        "--planb_policy",
+        type=str,
+        default=os.environ.get("PLANB_POLICY", "topo"),
+        choices=["topo", "dualvln_rpc"],
+    )
+    ap.add_argument(
+        "--dualvln_server_url",
+        type=str,
+        default=os.environ.get("DUALVLN_SERVER_URL", "http://127.0.0.1:18080"),
+    )
+    ap.add_argument(
+        "--dualvln_rpc_timeout_s",
+        type=float,
+        default=float(os.environ.get("DUALVLN_RPC_TIMEOUT_S", "5")),
+    )
+    ap.add_argument(
+        "--dualvln_rpc_fallback",
+        type=str,
+        default=os.environ.get("DUALVLN_RPC_FALLBACK", "topo"),
+        choices=["topo", "stop"],
+    )
     ap.add_argument("--controller_mode", type=str, default="bearing", choices=["bearing", "follower", "waypoint_follow"])
     ap.add_argument("--max_steps", type=int, default=120)
     ap.add_argument("--goal_topk", type=int, default=5)

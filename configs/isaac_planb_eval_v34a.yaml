@@ -1,0 +1,21 @@
+version: 34
+scene: office_localized
+scenes_config: configs/isaac_scenes_v29.yaml
+goal_catalog: configs/isaac_goal_catalog_v34a.yaml
+starts:
+  - id: start_v34a_001
+    pose: {x: 0.0, z: 2.8, yaw_deg: -110}
+    bucket: hard
+selection:
+  include_buckets: ["easy", "med", "hard"]
+  max_goals: 1
+  max_starts: 1
+run:
+  condition: gt_pose
+  max_steps: 80
+  seed: 0
+  renderer: rtx
+  build_debug_ui: all
+  timeout_s: 600
+output:
+  root: runs/topo_mvp/v34a_dual_gpu/baseline
