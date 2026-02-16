@@ -157,10 +157,11 @@ def _extract_depth_frame(obs: Any, backend: SimBackend, preferred_key: str = "")
     if len(candidates) == 0:
         return None, ""
     pref = str(preferred_key or "").strip()
-    if pref:
+    if pref and pref.lower() != "auto":
         for key, arr in candidates:
             if key == pref or key.endswith(pref):
                 return arr, key
+        return None, ""
     key, arr = candidates[0]
     return arr, key
 
@@ -557,22 +558,31 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
     v33b_far = float(camera_info.get("camera_far", 50.0)) if isinstance(camera_info, dict) else 50.0
     v33b_steer_latch_side = 0
     v33b_steer_latch_steps = 0
-    v33b_depth_key_req = str(os.environ.get("V33B_DEPTH_KEY", "")).strip()
+    v33b_depth_key_req = str(os.environ.get("V33B_DEPTH_KEY", "obs.depth")).strip() or "obs.depth"
     v33b_depth_key_used = ""
+    v33b_depth_missing_key = False
     v33b_depth_prev_roi: Optional[np.ndarray] = None
     v33b_depth_stale_delta_streak = 0
     v33b_depth_same_stats_k = 0
     v33b_depth_prev_blocked_stats: Optional[Tuple[float, float, float]] = None
     v33b_depth_unreliable = False
+    v33b_depth_stale_pose_moved = False
     v33b_depth_hash_prev = ""
-    v33b_depth_hash_repeat = 0
     v33b_rgb_hash_prev = ""
+    v33b_depth_hash_repeat = 0
+    v33b_pose_move_k = 0
+    v33b_stationary_k = 0
+    v33b_robot_stationary_events = 0
+    v33b_last_step_dpos = 0.0
+    v33b_last_step_dyaw_deg = 0.0
     v33b_collision_hist: Deque[int] = collections.deque(maxlen=6)
     v33b_probe_failures = 0
     if v33b_enabled:
         print(
             f"[V33B_CFG] enable=1 require_depth={int(args.v33b_require_depth)} clearance_m={float(args.v33b_clearance_m):.2f} "
-            f"offsets={v33b_offsets} doorway={int(args.v33b_doorway_trigger)} depth_key={v33b_depth_key_req or 'auto'}",
+            f"offsets={v33b_offsets} doorway={int(args.v33b_doorway_trigger)} depth_key={v33b_depth_key_req} "
+            f"stale_dpos_eps={float(args.v33b_stale_dpos_eps):.3f} stale_dyaw_eps={float(args.v33b_stale_dyaw_eps):.1f} "
+            f"stale_k={int(args.v33b_stale_k)} stationary_k={int(args.v33b_stationary_k)}",
             flush=True,
         )
     dist_trace: Deque[float] = collections.deque(maxlen=max(3, int(args.stall_window)))
@@ -799,6 +809,11 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
 
             # v33b: depth/costmap local avoidance as an action filter.
             if v33b_enabled and not v33b_depth_disabled:
+                print(
+                    f"[V33B_POSE_DELTA] step={step} dpos_m={float(v33b_last_step_dpos):.4f} "
+                    f"dyaw_deg={float(v33b_last_step_dyaw_deg):.3f}",
+                    flush=True,
+                )
                 if step == 0:
                     cands = _collect_depth_candidates(obs=obs, backend=backend)
                     key_desc: List[str] = []
@@ -817,14 +832,16 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                     print(f"[V33B_DEPTH_KEYS] keys={key_desc}", flush=True)
                 depth_frame, depth_source = _extract_depth_frame(obs, backend, preferred_key=v33b_depth_key_req)
                 if depth_frame is None:
+                    v33b_depth_missing_key = True
                     if not v33b_depth_caps_logged:
+                        avail = [k for k, _ in _collect_depth_candidates(obs=obs, backend=backend)]
                         print(
-                            '[V33B_CAPS] depth=0 reason=no_depth_in_obs hint="set ISAAC_ENABLE_DEPTH=1 or enable depth in backend"',
+                            f"[V33B_CAPS] depth=0 reason=depth_missing_key key={v33b_depth_key_req} available_keys={avail}",
                             flush=True,
                         )
                         v33b_depth_caps_logged = True
                     if bool(args.v33b_require_depth):
-                        fail_reason = "backend_caps_depth_missing"
+                        fail_reason = "backend_caps_depth_missing_key"
                         terminated_by = "early_stop"
                         print(
                             f"[TOPO_NAV_FAIL] reason={fail_reason} steps={step}",
@@ -832,6 +849,11 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                         )
                         break
                     v33b_depth_disabled = True
+                    print(
+                        f"[V33B_LOCAL_AVOID] step={step} skip=1 blocked=0 override=0 "
+                        f"reason=depth_missing_key action_in={base_action_name} action_out={action_name}",
+                        flush=True,
+                    )
                 else:
                     d = np.asarray(depth_frame, dtype=np.float32)
                     if d.ndim == 3:
@@ -839,6 +861,11 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                     v33b_depth_ready = True
                     v33b_depth_source = str(depth_source)
                     v33b_depth_key_used = str(depth_source)
+                    if step == 0:
+                        print(
+                            f"[V33B_DEPTH_KEY_USED] key={v33b_depth_key_used} shape={list(d.shape)} dtype={d.dtype}",
+                            flush=True,
+                        )
                     if (not v33b_depth_caps_logged) and d.ndim == 2:
                         print(
                             f"[V33B_CAPS] depth=1 h={int(d.shape[0])} w={int(d.shape[1])} "
@@ -849,10 +876,30 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                     if (not v33b_depth_disabled) and d.ndim == 2 and d.size > 0:
                         rgb_md5 = hashlib.md5(np.ascontiguousarray(rgb).tobytes()).hexdigest()
                         depth_md5 = hashlib.md5(np.ascontiguousarray(d).tobytes()).hexdigest()
-                        if depth_md5 == v33b_depth_hash_prev:
-                            v33b_depth_hash_repeat += 1
+                        rgb_same = int(bool(v33b_rgb_hash_prev) and rgb_md5 == v33b_rgb_hash_prev)
+                        depth_same = int(bool(v33b_depth_hash_prev) and depth_md5 == v33b_depth_hash_prev)
+                        pose_moved = int(
+                            (float(v33b_last_step_dpos) >= float(args.v33b_stale_dpos_eps))
+                            or (abs(float(v33b_last_step_dyaw_deg)) >= float(args.v33b_stale_dyaw_eps))
+                        )
+                        if rgb_same and depth_same:
+                            if pose_moved:
+                                v33b_pose_move_k += 1
+                                v33b_stationary_k = 0
+                            else:
+                                v33b_stationary_k += 1
+                                v33b_pose_move_k = 0
+                                if v33b_stationary_k == int(args.v33b_stationary_k):
+                                    v33b_robot_stationary_events += 1
                         else:
-                            v33b_depth_hash_repeat = 0
+                            v33b_pose_move_k = 0
+                            v33b_stationary_k = 0
+                        v33b_depth_hash_repeat = int(v33b_pose_move_k)
+                        print(
+                            f"[V33B_STALE_CHECK] step={step} pose_moved={pose_moved} rgb_same={rgb_same} depth_same={depth_same} "
+                            f"stale_k={int(v33b_pose_move_k)} stationary_k={int(v33b_stationary_k)}",
+                            flush=True,
+                        )
                         v33b_depth_hash_prev = depth_md5
                         v33b_rgb_hash_prev = rgb_md5
                         if step % 10 == 0:
@@ -860,12 +907,13 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                                 f"[V33B_OBS_HASH] step={step} rgb_md5={rgb_md5} depth_md5={depth_md5}",
                                 flush=True,
                             )
-                        if v33b_depth_hash_repeat >= 10:
+                        if v33b_pose_move_k >= int(args.v33b_stale_k):
                             v33b_depth_unreliable = True
+                            v33b_depth_stale_pose_moved = True
                             v33b_depth_disabled = True
-                            print("[V33B_CAPS] depth=0 reason=depth_stale_or_invalid", flush=True)
+                            print("[V33B_CAPS] depth=0 reason=depth_stale_pose_moved", flush=True)
                             if bool(args.v33b_require_depth):
-                                fail_reason = "backend_caps_depth_stale"
+                                fail_reason = "backend_caps_depth_stale_pose_moved"
                                 terminated_by = "early_stop"
                                 print(
                                     f"[TOPO_NAV_FAIL] reason={fail_reason} steps={step}",
@@ -874,7 +922,7 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                                 break
                             print(
                                 f"[V33B_LOCAL_AVOID] step={step} skip=1 blocked=0 override=0 "
-                                f"reason=depth_stale_or_invalid action_in={base_action_name} action_out={action_name}",
+                                f"reason=depth_stale_pose_moved action_in={base_action_name} action_out={action_name}",
                                 flush=True,
                             )
                     if d.ndim == 2 and d.size > 0:
@@ -1001,14 +1049,10 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                                 )
                                 v33b_depth_stats_logged = True
 
-                            if (
-                                blocked
-                                and (v33b_depth_stale_delta_streak >= 10 or v33b_depth_same_stats_k >= 5)
-                                and not v33b_depth_unreliable
-                            ):
-                                v33b_depth_unreliable = True
+                            if blocked and (v33b_depth_stale_delta_streak >= 10 or v33b_depth_same_stats_k >= 5):
+                                # Keep as diagnostics only. Stale-disable path is pose-aware hash check above.
                                 print(
-                                    f"[V33B_DEPTH_STALE] trigger=1 mean_delta={depth_mean_delta:.4f} "
+                                    f"[V33B_DEPTH_STALE] trigger=0 mean_delta={depth_mean_delta:.4f} "
                                     f"same_stats_k={int(v33b_depth_same_stats_k)} action_in=FORWARD action_out=FORWARD",
                                     flush=True,
                                 )
@@ -1089,12 +1133,6 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                                 else:
                                     if v33b_depth_unreliable:
                                         override_reason = "blocked_depth_stale_pass_through"
-                                        print(
-                                            f"[V33B_DEPTH_STALE] trigger=1 mean_delta={depth_mean_delta:.4f} "
-                                            f"same_stats_k={int(v33b_depth_same_stats_k)} "
-                                            f"action_in=FORWARD action_out=FORWARD",
-                                            flush=True,
-                                        )
                                     else:
                                         override_reason = "blocked_no_collision_probe"
                                         v33b_forward_probe_applied = True
@@ -1130,6 +1168,8 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             new_pos = np.array([obs_next.pose.x, obs_next.pose.y, obs_next.pose.z], dtype=np.float32)
             moved = float(np.linalg.norm(new_pos - prev_pos))
             yaw_delta = _wrap_pi(float(obs_next.pose.yaw) - float(obs.pose.yaw))
+            v33b_last_step_dpos = float(moved)
+            v33b_last_step_dyaw_deg = float(math.degrees(float(yaw_delta)))
             yaw_delta_trace.append(float(yaw_delta))
             fwd_no_motion = bool(int(action) == 1 and moved < 0.01)
             if args.controller_mode != "follower":
@@ -1270,6 +1310,7 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             "depth_source": str(v33b_depth_source),
             "depth_key_requested": str(v33b_depth_key_req),
             "depth_key_used": str(v33b_depth_key_used),
+            "depth_missing_key": int(v33b_depth_missing_key),
             "blocked_detected_count": int(v33b_blocked_detected_count),
             "override_count": int(v33b_override_count),
             "blocked_no_override_count": int(v33b_blocked_no_override_count),
@@ -1282,7 +1323,11 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             "blocked_forward_reasons": {
                 str(k): int(v) for k, v in sorted(v33b_blocked_forward_reasons.items())
             },
-            "depth_stale_or_invalid": int(v33b_depth_unreliable),
+            "depth_stale_or_invalid": int(v33b_depth_stale_pose_moved),
+            "depth_stale_pose_moved": int(v33b_depth_stale_pose_moved),
+            "robot_stationary_events": int(v33b_robot_stationary_events),
+            "stale_pose_moved_k": int(v33b_pose_move_k),
+            "stationary_k": int(v33b_stationary_k),
             "depth_unreliable": int(v33b_depth_unreliable),
             "depth_stale_delta_streak": int(v33b_depth_stale_delta_streak),
             "depth_same_stats_k": int(v33b_depth_same_stats_k),
@@ -1500,6 +1545,10 @@ def main() -> None:
     ap.add_argument("--v33b_min_improve_m", type=float, default=float(os.environ.get("V33B_MIN_IMPROVE_M", "0.10")))
     ap.add_argument("--v33b_steer_hyst_steps", type=int, default=int(os.environ.get("V33B_STEER_HYST_STEPS", "5")))
     ap.add_argument("--v33b_doorway_trigger", type=int, default=int(os.environ.get("V33B_DOORWAY_TRIGGER", "1")))
+    ap.add_argument("--v33b_stale_dpos_eps", type=float, default=float(os.environ.get("V33B_STALE_DPOS_EPS", "0.02")))
+    ap.add_argument("--v33b_stale_dyaw_eps", type=float, default=float(os.environ.get("V33B_STALE_DYAW_EPS", "2.0")))
+    ap.add_argument("--v33b_stale_k", type=int, default=int(os.environ.get("V33B_STALE_K", "3")))
+    ap.add_argument("--v33b_stationary_k", type=int, default=int(os.environ.get("V33B_STATIONARY_K", "20")))
     ap.add_argument(
         "--v33b_doorway_hyst_steps",
         type=int,

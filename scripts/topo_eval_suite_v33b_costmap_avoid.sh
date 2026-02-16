@@ -26,6 +26,52 @@ if [ "${1:-}" = "--small" ]; then
   SMALL_ARG="--small"
 fi
 
+run_capture_motion() {
+  local capture_dir="$1"
+  local tag="$2"
+  if [ -z "${capture_dir}" ] || [ ! -d "${capture_dir}" ]; then
+    echo "[CAPTURE_MOTION] frames=0 identical_pairs=0 mean_rgb_diff=0.000000 mean_depth_diff=0.000000 reason=missing_capture_dir tag=${tag}" | tee -a "${MASTER_LOG}"
+    return 0
+  fi
+  (
+    bash scripts/tools/check_capture_motion.sh --capture_dir "${capture_dir}" --tag "${tag}"
+  ) 2>&1 | tee -a "${MASTER_LOG}"
+}
+
+find_representative_capture_dir() {
+  local run_root="$1"
+  python3 - "$run_root" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+fc = root / "failure_cases.jsonl"
+if fc.exists():
+    for line in fc.read_text(encoding='utf-8', errors='ignore').splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        dbg = str(rec.get("debug_index", "") or "").strip()
+        if not dbg:
+            continue
+        p = pathlib.Path(dbg)
+        if p.exists():
+            run_dir = p.parent.parent
+            if (run_dir / "frames").exists():
+                print(str(run_dir))
+                raise SystemExit(0)
+            print(str(run_dir))
+            raise SystemExit(0)
+for p in sorted((root / "debug_runs").glob("*/*")):
+    if p.is_dir():
+        print(str(p))
+        raise SystemExit(0)
+print("")
+PY
+}
+
 python3 - "$BASE_CFG" "$RUNTIME_CFG_BASE" "$RUNTIME_CFG_V33B" "$BASELINE_ROOT" "$V33B_ROOT" "$SMALL_ARG" <<'PY'
 import json, pathlib, sys
 base = pathlib.Path(sys.argv[1])
@@ -77,6 +123,7 @@ python3 scripts/gpu/gpu_router.py --role isaac --output anchors | tee -a "${MAST
 (
   bash scripts/isaac/depth_fidelity_v33b4.sh
 ) 2>&1 | tee -a "${MASTER_LOG}"
+run_capture_motion "${ROOT_DIR}/runs/topo_mvp/v33b4_depth_fidelity/capture" "depth_fidelity"
 
 # Baseline (same runtime config, v33b disabled)
 (
@@ -95,6 +142,11 @@ python3 scripts/gpu/gpu_router.py --role isaac --output anchors | tee -a "${MAST
   export V33B_STEER_HYST_STEPS="${V33B_STEER_HYST_STEPS:-5}"
   export V33B_DOORWAY_TRIGGER="${V33B_DOORWAY_TRIGGER:-1}"
   export V33B_DOORWAY_HYST_STEPS="${V33B_DOORWAY_HYST_STEPS:-8}"
+  export V33B_DEPTH_KEY="${V33B_DEPTH_KEY:-obs.depth}"
+  export V33B_STALE_DPOS_EPS="${V33B_STALE_DPOS_EPS:-0.02}"
+  export V33B_STALE_DYAW_EPS="${V33B_STALE_DYAW_EPS:-2.0}"
+  export V33B_STALE_K="${V33B_STALE_K:-3}"
+  export V33B_STATIONARY_K="${V33B_STATIONARY_K:-20}"
   bash scripts/gpu/run_isaac_on_5090.sh -- \
     python3 scripts/topo_planb_scale_eval_v31.py --config "${RUNTIME_CFG_BASE}" ${SMALL_ARG}
 ) 2>&1 | tee -a "${BASELINE_LOG}" "${MASTER_LOG}"
@@ -104,6 +156,8 @@ python3 scripts/gpu/gpu_router.py --role isaac --output anchors | tee -a "${MAST
     "${BASELINE_ROOT}/failure_cases.jsonl" \
     "${BASELINE_ROOT}/failure_cards"
 ) 2>&1 | tee -a "${BASELINE_LOG}" "${MASTER_LOG}"
+BASELINE_CAPTURE_DIR="$(find_representative_capture_dir "${BASELINE_ROOT}")"
+run_capture_motion "${BASELINE_CAPTURE_DIR}" "baseline_repr"
 
 # v33b enabled run (same runtime config)
 (
@@ -122,6 +176,11 @@ python3 scripts/gpu/gpu_router.py --role isaac --output anchors | tee -a "${MAST
   export V33B_STEER_HYST_STEPS="${V33B_STEER_HYST_STEPS:-5}"
   export V33B_DOORWAY_TRIGGER="${V33B_DOORWAY_TRIGGER:-1}"
   export V33B_DOORWAY_HYST_STEPS="${V33B_DOORWAY_HYST_STEPS:-8}"
+  export V33B_DEPTH_KEY="${V33B_DEPTH_KEY:-obs.depth}"
+  export V33B_STALE_DPOS_EPS="${V33B_STALE_DPOS_EPS:-0.02}"
+  export V33B_STALE_DYAW_EPS="${V33B_STALE_DYAW_EPS:-2.0}"
+  export V33B_STALE_K="${V33B_STALE_K:-3}"
+  export V33B_STATIONARY_K="${V33B_STATIONARY_K:-20}"
   bash scripts/gpu/run_isaac_on_5090.sh -- \
     python3 scripts/topo_planb_scale_eval_v31.py --config "${RUNTIME_CFG_V33B}" ${SMALL_ARG}
 ) 2>&1 | tee -a "${V33B_LOG}" "${MASTER_LOG}"
@@ -131,6 +190,8 @@ python3 scripts/gpu/gpu_router.py --role isaac --output anchors | tee -a "${MAST
     "${V33B_ROOT}/failure_cases.jsonl" \
     "${V33B_ROOT}/failure_cards"
 ) 2>&1 | tee -a "${V33B_LOG}" "${MASTER_LOG}"
+V33B_CAPTURE_DIR="$(find_representative_capture_dir "${V33B_ROOT}")"
+run_capture_motion "${V33B_CAPTURE_DIR}" "v33b_repr"
 
 python3 - "${BASELINE_ROOT}/summary.json" "${V33B_ROOT}/summary.json" <<'PY' | tee -a "${MASTER_LOG}"
 import json, pathlib, sys
@@ -160,15 +221,21 @@ DEPTH_KEY_USED="$(python3 - "${V33B_ROOT}/summary.json" <<'PY'
 import json, pathlib, sys
 p = pathlib.Path(sys.argv[1])
 if not p.exists():
-    print("unset")
+    print("unset unset unset")
     raise SystemExit(0)
 obj = json.loads(p.read_text(encoding='utf-8'))
 v = obj.get("v33b", {}) if isinstance(obj.get("v33b", {}), dict) else {}
 dk = v.get("depth_key_used", {})
 if isinstance(dk, dict) and len(dk) > 0:
-    print(",".join(f"{k}:{v}" for k, v in sorted(dk.items())))
+    key_s = ",".join(f"{k}:{v}" for k, v in sorted(dk.items()))
 else:
-    print("unset")
+    key_s = "unset"
+stale_runs = int(v.get("depth_stale_pose_moved_runs", v.get("depth_stale_runs", 0)) or 0)
+stationary_runs = int(v.get("robot_stationary_runs", 0) or 0)
+print(f"{key_s} {stale_runs} {stationary_runs}")
 PY
 )"
-echo "[V33B_SUITE_OK] baseline_root=${BASELINE_ROOT} v33b_root=${V33B_ROOT} baseline_summary=${BASELINE_ROOT}/summary.json v33b_summary=${V33B_ROOT}/summary.json v33b_cards=${V33B_ROOT}/failure_cards/index.html depth_key_used=${DEPTH_KEY_USED}" | tee -a "${MASTER_LOG}"
+DEPTH_KEY_VALUE="$(echo "${DEPTH_KEY_USED}" | awk '{print $1}')"
+DEPTH_STALE_RUNS="$(echo "${DEPTH_KEY_USED}" | awk '{print $2}')"
+ROBOT_STATIONARY_RUNS="$(echo "${DEPTH_KEY_USED}" | awk '{print $3}')"
+echo "[V33B_SUITE_OK] baseline_root=${BASELINE_ROOT} v33b_root=${V33B_ROOT} baseline_summary=${BASELINE_ROOT}/summary.json v33b_summary=${V33B_ROOT}/summary.json v33b_cards=${V33B_ROOT}/failure_cards/index.html depth_key_used=${DEPTH_KEY_VALUE} depth_stale_pose_moved_runs=${DEPTH_STALE_RUNS} robot_stationary_runs=${ROBOT_STATIONARY_RUNS}" | tee -a "${MASTER_LOG}"

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -70,6 +71,18 @@ def _rgb_luma(rgb: np.ndarray) -> float:
     return float(np.mean(luma))
 
 
+def _wrap_pi(x: float) -> float:
+    while x > math.pi:
+        x -= 2.0 * math.pi
+    while x < -math.pi:
+        x += 2.0 * math.pi
+    return x
+
+
+def _action_name(action_id: int) -> str:
+    return {0: "STOP", 1: "FORWARD", 2: "LEFT", 3: "RIGHT"}.get(int(action_id), "UNKNOWN")
+
+
 def run(scene_id: str, config_path: str, out_dir: str, frames: int, stage_override: str) -> int:
     out = Path(out_dir)
     rgb_dir = out / "rgb"
@@ -98,16 +111,36 @@ def run(scene_id: str, config_path: str, out_dir: str, frames: int, stage_overri
     )
 
     try:
-        obs = backend.reset(scene_id=scene_id, start_spec={"start_offset": 0})
+        backend.reset(scene_id=scene_id, start_spec={"start_offset": 0})
         n = max(10, int(frames))
-        actions = [3, 3, 1, 2, 2, 1, 3, 2, 1, 1]
+        # Deterministic move-before-capture pattern to force observable scene changes.
+        actions = [3, 3, 1, 2, 2, 1, 3, 1, 2, 1]
         rgbs: List[np.ndarray] = []
         depths: List[np.ndarray] = []
-        rgb_deltas: List[float] = []
+        depth_deltas: List[float] = []
 
         prev_rgb = None
         prev_depth = None
+        prev_pose = None
         for i in range(n):
+            act = int(actions[i % len(actions)])
+            print(f"[ISAAC_CAPTURE_STEP] frame={i} action={_action_name(act)}", flush=True)
+            obs, _, _ = backend.step(act)
+
+            pose = backend.get_pose()
+            if prev_pose is None:
+                dpos = 0.0
+                dyaw_deg = 0.0
+            else:
+                dpos = float(math.hypot(float(pose.x) - float(prev_pose.x), float(pose.z) - float(prev_pose.z)))
+                dyaw_deg = float(math.degrees(_wrap_pi(float(pose.yaw) - float(prev_pose.yaw))))
+            print(
+                f"[ISAAC_CAPTURE_POSE] frame={i} x={float(pose.x):.4f} z={float(pose.z):.4f} "
+                f"yaw_deg={float(math.degrees(float(pose.yaw))):.3f} dpos_m={dpos:.4f} dyaw_deg={dyaw_deg:.3f}",
+                flush=True,
+            )
+            prev_pose = pose
+
             rgb = np.asarray(obs.rgb, dtype=np.uint8)
             depth = None if obs.depth is None else np.asarray(obs.depth, dtype=np.float32)
             Image.fromarray(rgb).save(rgb_dir / f"rgb_{i:03d}.png")
@@ -120,6 +153,10 @@ def run(scene_id: str, config_path: str, out_dir: str, frames: int, stage_overri
 
             if depth is None:
                 print(f"[ISAAC_DEPTH_SAMPLE] step={i} valid_ratio=0.0000 min=nan p20=nan p50=nan p80=nan max=nan", flush=True)
+                print(
+                    f"[ISAAC_CAPTURE_HASH] frame={i} rgb_md5={hashlib.md5(np.ascontiguousarray(rgb).tobytes()).hexdigest()} depth_md5=none",
+                    flush=True,
+                )
             else:
                 np.save(depth_npy_dir / f"depth_{i:03d}.npy", depth)
                 depth_vis = _depth_to_png(depth)
@@ -140,17 +177,18 @@ def run(scene_id: str, config_path: str, out_dir: str, frames: int, stage_overri
                     f"[ISAAC_DEPTH_SAMPLE] step={i} valid_ratio={valid_ratio:.4f} min={mn:.4f} p20={p20:.4f} p50={p50:.4f} p80={p80:.4f} max={mx:.4f}",
                     flush=True,
                 )
+                rgb_md5 = hashlib.md5(np.ascontiguousarray(rgb).tobytes()).hexdigest()
+                depth_md5 = hashlib.md5(np.ascontiguousarray(depth).tobytes()).hexdigest()
+                print(f"[ISAAC_CAPTURE_HASH] frame={i} rgb_md5={rgb_md5} depth_md5={depth_md5}", flush=True)
                 if prev_depth is not None:
-                    rgb_deltas.append(_depth_delta(prev_depth, depth))
+                    depth_deltas.append(_depth_delta(prev_depth, depth))
 
             prev_rgb = rgb
             if depth is not None:
                 prev_depth = depth
-            act = actions[i % len(actions)]
-            obs, _, _ = backend.step(int(act))
 
-        depth_mean_delta = float(np.mean(rgb_deltas)) if len(rgb_deltas) > 0 else 0.0
-        depth_std_delta = float(np.std(rgb_deltas)) if len(rgb_deltas) > 0 else 0.0
+        depth_mean_delta = float(np.mean(depth_deltas)) if len(depth_deltas) > 0 else 0.0
+        depth_std_delta = float(np.std(depth_deltas)) if len(depth_deltas) > 0 else 0.0
         depth_constant = int(depth_mean_delta < 0.002)
 
         meta = {

@@ -265,6 +265,9 @@ def _parse_v33b_log(log_path: Path) -> Dict[str, Any]:
         "blocked_no_override": 0,
         "doorway": 0,
         "caps_depth0": 0,
+        "depth_stale_pose_moved": 0,
+        "robot_stationary": 0,
+        "caps_depth_missing_key": 0,
     }
     reason_counts: Dict[str, int] = {}
     if not log_path.exists():
@@ -287,6 +290,17 @@ def _parse_v33b_log(log_path: Path) -> Dict[str, Any]:
             out["doorway"] += 1
         if "[V33B_CAPS]" in line and "depth=0" in line:
             out["caps_depth0"] += 1
+            if "reason=depth_stale_pose_moved" in line:
+                out["depth_stale_pose_moved"] += 1
+            if "reason=depth_missing_key" in line:
+                out["caps_depth_missing_key"] += 1
+        if (
+            "[V33B_STALE_CHECK]" in line
+            and "pose_moved=0" in line
+            and "rgb_same=1" in line
+            and "depth_same=1" in line
+        ):
+            out["robot_stationary"] += 1
     out["blocked_no_override_reasons"] = reason_counts
     return out
 
@@ -781,7 +795,19 @@ def main() -> int:
             if not isinstance(blocked_forward_reasons, dict):
                 blocked_forward_reasons = {}
             depth_key_used = str(result_v33b.get("depth_key_used", "") or "")
-            depth_stale_flag = int(result_v33b.get("depth_stale_or_invalid", 0) or 0)
+            depth_stale_flag = int(
+                result_v33b.get(
+                    "depth_stale_pose_moved",
+                    result_v33b.get("depth_stale_or_invalid", v33b_stats.get("depth_stale_pose_moved", 0)),
+                )
+                or 0
+            )
+            robot_stationary_events = int(
+                result_v33b.get("robot_stationary_events", v33b_stats.get("robot_stationary", 0)) or 0
+            )
+            depth_missing_key_flag = int(
+                result_v33b.get("depth_missing_key", v33b_stats.get("caps_depth_missing_key", 0)) or 0
+            )
 
             if goal_type == "room":
                 room_ok, room_metrics = is_room_success_from_trace(trace_rows, g)
@@ -880,6 +906,9 @@ def main() -> int:
                     str(k): int(v) for k, v in sorted(blocked_forward_reasons.items())
                 },
                 "v33b_depth_stale_or_invalid": depth_stale_flag,
+                "v33b_depth_stale_pose_moved": depth_stale_flag,
+                "v33b_robot_stationary_events": robot_stationary_events,
+                "v33b_depth_missing_key": depth_missing_key_flag,
                 "v33b_depth_key_used": depth_key_used,
                 "v33b_doorway_trigger_count": doorway_trigger_count,
                 "v33b_caps_depth0": int(v33b_stats.get("caps_depth0", 0)),
@@ -934,7 +963,9 @@ def main() -> int:
     )
     v33b_doorway_total = int(sum(int(r.get("v33b_doorway_trigger_count", 0) or 0) for r in records))
     v33b_depth_missing = int(sum(int(r.get("v33b_caps_depth0", 0) or 0) for r in records))
-    v33b_depth_stale_runs = int(sum(1 for r in records if int(r.get("v33b_depth_stale_or_invalid", 0) or 0) > 0))
+    v33b_depth_stale_runs = int(sum(1 for r in records if int(r.get("v33b_depth_stale_pose_moved", 0) or 0) > 0))
+    v33b_robot_stationary_runs = int(sum(1 for r in records if int(r.get("v33b_robot_stationary_events", 0) or 0) > 0))
+    v33b_depth_missing_key_runs = int(sum(1 for r in records if int(r.get("v33b_depth_missing_key", 0) or 0) > 0))
     v33b_depth_key_counter = Counter(str(r.get("v33b_depth_key_used", "") or "unset") for r in records)
     v33b_no_override_reasons = Counter()
     for r in records:
@@ -988,6 +1019,9 @@ def main() -> int:
             "doorway_triggers_total": v33b_doorway_total,
             "depth_caps_missing_runs": v33b_depth_missing,
             "depth_stale_runs": v33b_depth_stale_runs,
+            "depth_stale_pose_moved_runs": v33b_depth_stale_runs,
+            "robot_stationary_runs": v33b_robot_stationary_runs,
+            "depth_missing_key_runs": v33b_depth_missing_key_runs,
             "depth_key_used": dict(sorted(v33b_depth_key_counter.items())),
         },
         "small_mode": int(bool(args.small)),
@@ -1027,7 +1061,9 @@ def main() -> int:
         f"blocked_forward_pass_through={v33b_blocked_forward_pass_total} "
         f"blocked_forward_reasons=\"{','.join(f'{k}:{v}' for k, v in sorted(v33b_forward_reasons.items()))}\" "
         f"doorway_triggers={v33b_doorway_total} depth_caps_missing_runs={v33b_depth_missing} "
-        f"depth_stale_runs={v33b_depth_stale_runs} depth_key_used=\"{','.join(f'{k}:{v}' for k, v in sorted(v33b_depth_key_counter.items()))}\""
+        f"depth_stale_runs={v33b_depth_stale_runs} depth_stale_pose_moved_runs={v33b_depth_stale_runs} "
+        f"robot_stationary_runs={v33b_robot_stationary_runs} depth_missing_key_runs={v33b_depth_missing_key_runs} "
+        f"depth_key_used=\"{','.join(f'{k}:{v}' for k, v in sorted(v33b_depth_key_counter.items()))}\""
     )
     print(v33a_anchor, flush=True)
     print(v33b_anchor, flush=True)
