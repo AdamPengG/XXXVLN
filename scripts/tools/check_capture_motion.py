@@ -25,8 +25,12 @@ def _find_depth_npy_files(root: Path) -> List[Path]:
     return cands
 
 
-def _load_image(p: Path) -> np.ndarray:
-    return np.asarray(Image.open(p).convert("RGB"), dtype=np.float32)
+def _load_image(p: Path) -> Optional[np.ndarray]:
+    try:
+        with Image.open(p) as im:
+            return np.asarray(im.convert("RGB"), dtype=np.float32)
+    except Exception:
+        return None
 
 
 def _load_depth(p: Path) -> Optional[np.ndarray]:
@@ -121,8 +125,15 @@ def main() -> int:
         print(f"[CAPTURE_MOTION] frames=0 identical_pairs=0 mean_rgb_diff=0.000000 mean_depth_diff=0.000000 reason=missing_capture_dir tag={args.tag}")
         return 2
 
-    rgb_files = _find_rgb_files(cap)
-    rgb_frames = [_load_image(p) for p in rgb_files]
+    rgb_files_all = _find_rgb_files(cap)
+    rgb_files: List[Path] = []
+    rgb_frames: List[np.ndarray] = []
+    for p in rgb_files_all:
+        arr = _load_image(p)
+        if arr is None:
+            continue
+        rgb_files.append(p)
+        rgb_frames.append(arr)
     rgb_diffs, rgb_identical = _pair_diffs(rgb_frames)
 
     depth_files = _find_depth_npy_files(cap)
