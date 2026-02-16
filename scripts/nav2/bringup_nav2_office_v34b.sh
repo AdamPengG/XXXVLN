@@ -12,12 +12,20 @@ LOG_FILE="${LOG_DIR}/nav2_bringup_v34b.log"
 : > "${LOG_FILE}"
 
 if ! command -v ros2 >/dev/null 2>&1; then
-  echo "[V34B_NAV2_BRINGUP] ok=0 map=${MAP_YAML} frames=\"map,odom,base_link\" controller=none reason=ros2_not_found" | tee -a "${LOG_FILE}"
+  echo "[V34B_NAV2_BRINGUP] ok=0 map=${MAP_YAML} frames=\"map,odom,base_link\" controller=none planner=none reason=ros2_not_found" | tee -a "${LOG_FILE}"
+  exit 0
+fi
+
+if ! python3 - <<'PY' >/dev/null 2>&1
+import rclpy  # noqa: F401
+PY
+then
+  echo "[V34B_NAV2_BRINGUP] ok=0 map=${MAP_YAML} frames=\"map,odom,base_link\" controller=none planner=none reason=rclpy_not_found" | tee -a "${LOG_FILE}"
   exit 0
 fi
 
 if [ ! -f "${MAP_YAML}" ]; then
-  echo "[V34B_NAV2_BRINGUP] ok=0 map=${MAP_YAML} frames=\"map,odom,base_link\" controller=none reason=map_missing" | tee -a "${LOG_FILE}"
+  echo "[V34B_NAV2_BRINGUP] ok=0 map=${MAP_YAML} frames=\"map,odom,base_link\" controller=none planner=none reason=map_missing" | tee -a "${LOG_FILE}"
   exit 0
 fi
 
@@ -30,7 +38,7 @@ PID=$!
 echo "${PID}" > "${LOG_DIR}/nav2_bringup.pid"
 
 READY=0
-for _ in $(seq 1 20); do
+for _ in $(seq 1 30); do
   if ros2 action list 2>/dev/null | grep -q "/navigate_to_pose"; then
     READY=1
     break
@@ -39,9 +47,9 @@ for _ in $(seq 1 20); do
 done
 
 if [ "${READY}" = "1" ]; then
-  echo "[V34B_NAV2_BRINGUP] ok=1 map=${MAP_YAML} frames=\"map,odom,base_link\" controller=nav2" | tee -a "${LOG_FILE}"
+  echo "[V34B_NAV2_BRINGUP] ok=1 map=${MAP_YAML} frames=\"map,odom,base_link\" controller=nav2_controller planner=navfn" | tee -a "${LOG_FILE}"
 else
-  echo "[V34B_NAV2_BRINGUP] ok=0 map=${MAP_YAML} frames=\"map,odom,base_link\" controller=none reason=navigate_to_pose_not_ready" | tee -a "${LOG_FILE}"
+  echo "[V34B_NAV2_BRINGUP] ok=0 map=${MAP_YAML} frames=\"map,odom,base_link\" controller=none planner=none reason=navigate_to_pose_not_ready" | tee -a "${LOG_FILE}"
 fi
 
 exit 0

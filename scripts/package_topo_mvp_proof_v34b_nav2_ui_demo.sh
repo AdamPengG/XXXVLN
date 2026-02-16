@@ -10,7 +10,7 @@ ZIP="/home/peng/DualVLN/forGPT/v34b_nav2_ui_demo_PROOF_${TS}.zip"
 STAGE="/tmp/v34b_nav2_ui_demo_${TS}"
 
 rm -rf "${STAGE}"
-mkdir -p "${STAGE}/evidence"/{logs,map,eval,qa,capture,src_snapshot,git,system}
+mkdir -p "${STAGE}/evidence"/{logs,map,eval,qa,capture,physics,src_snapshot,git,system}
 
 cp "${OUT_ROOT}/summary.json" "${STAGE}/evidence/eval/" 2>/dev/null || true
 cp "${OUT_ROOT}"/logs/*.log "${STAGE}/evidence/logs/" 2>/dev/null || true
@@ -32,6 +32,7 @@ for p in "${OUT_ROOT}"/qa/overlay/overlay_rgb_*.png; do
   cp "${p}" "${STAGE}/evidence/qa/overlay/"
 done
 
+# representative capture artifacts (40+ RGB + motion reports)
 python3 - "${OUT_ROOT}/debug_runs" "${STAGE}/evidence/capture" <<'PY'
 from pathlib import Path
 import shutil, sys
@@ -40,29 +41,38 @@ dst = Path(sys.argv[2])
 dst.mkdir(parents=True, exist_ok=True)
 if not src.exists():
     raise SystemExit(0)
-# copy up to 20 rgb/depth files total across run dirs
-rgb = []
-depth = []
-for p in sorted(src.glob('**/rgb_*.png')):
-    rgb.append(p)
-for p in sorted(src.glob('**/depth_*.npy')):
-    depth.append(p)
-for p in rgb[:20]:
+rgb = sorted(src.glob('**/rgb_*.png'))
+depth = sorted(src.glob('**/depth_*.npy'))
+for p in rgb[:60]:
     out = dst / ('rgb_' + p.parent.name + '_' + p.name)
     shutil.copy2(p, out)
-for p in depth[:10]:
+for p in depth[:20]:
     out = dst / ('depth_' + p.parent.name + '_' + p.name)
     shutil.copy2(p, out)
-for p in sorted(src.glob('**/motion_report.json'))[:6]:
+for p in sorted(src.glob('**/motion_report.json')):
     shutil.copy2(p, dst / ('motion_' + p.parent.name + '.json'))
-for p in sorted(src.glob('**/motion_report.md'))[:6]:
+for p in sorted(src.glob('**/motion_report.md')):
     shutil.copy2(p, dst / ('motion_' + p.parent.name + '.md'))
-for p in sorted(src.glob('**/rgb.gif'))[:4]:
+for p in sorted(src.glob('**/rgb.gif')):
     shutil.copy2(p, dst / ('gif_' + p.parent.name + '.gif'))
 PY
 
+# physics smoke capture proving no tunnel
+if [ -d "${OUT_ROOT}/physics" ]; then
+  cp "${OUT_ROOT}"/physics/physics_drive_result.json "${STAGE}/evidence/physics/" 2>/dev/null || true
+  cp "${OUT_ROOT}"/physics/physics_drive.gif "${STAGE}/evidence/physics/" 2>/dev/null || true
+  mkdir -p "${STAGE}/evidence/physics/frames"
+  for p in "${OUT_ROOT}"/physics/frames/rgb_*.png; do
+    [ -f "${p}" ] || continue
+    cp "${p}" "${STAGE}/evidence/physics/frames/"
+  done
+  cp "${OUT_ROOT}"/physics/motion_report.json "${STAGE}/evidence/physics/" 2>/dev/null || true
+  cp "${OUT_ROOT}"/physics/motion_report.md "${STAGE}/evidence/physics/" 2>/dev/null || true
+fi
+
 cp scripts/isaac/run_ui_office_nav2_v34b.sh "${STAGE}/evidence/src_snapshot/"
 cp scripts/isaac/ui_office_nav2_probe_v34b.py "${STAGE}/evidence/src_snapshot/"
+cp scripts/isaac/physics_drive_smoke_v34b.py "${STAGE}/evidence/src_snapshot/"
 cp scripts/nav2/generate_office_map_v34b.py "${STAGE}/evidence/src_snapshot/"
 cp scripts/nav2/generate_office_map_v34b.sh "${STAGE}/evidence/src_snapshot/"
 cp scripts/nav2/bringup_nav2_office_v34b.sh "${STAGE}/evidence/src_snapshot/"

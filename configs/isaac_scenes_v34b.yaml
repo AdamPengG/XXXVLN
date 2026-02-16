@@ -5,7 +5,7 @@ global:
 
 scenes:
   - scene_id: "office_localized"
-    usd_path: "/home/peng/DualVLN/runs/topo_mvp/v28_isaac/assets_local/Assets/Isaac/5.1/Isaac/Environments/Office/office.usd"
+    usd_path: "/home/peng/isaacsim_assets/Assets/Isaac/5.1/Isaac/Environments/Office/office.usd"
     usd_hint: "office.usd"
     bounds: [-6.0, 6.0, -6.0, 6.0]
     cam_w: 1280
