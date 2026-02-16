@@ -196,6 +196,9 @@ def main() -> int:
     ap.add_argument("--idle_action", default=os.environ.get("V34D_IDLE_ACTION", "auto"))
     ap.add_argument("--cmd_lin_thresh", type=float, default=float(os.environ.get("V34D_CMD_LIN_THRESH", "0.05")))
     ap.add_argument("--cmd_ang_thresh", type=float, default=float(os.environ.get("V34D_CMD_ANG_THRESH", "0.05")))
+    ap.add_argument("--fidelity_frames", type=int, default=int(os.environ.get("V34F_FIDELITY_FRAMES", "10")))
+    ap.add_argument("--fidelity_luma_min", type=float, default=float(os.environ.get("V34F_FIDELITY_LUMA_MIN", "20.0")))
+    ap.add_argument("--fidelity_placeholder_max", type=float, default=float(os.environ.get("V34F_FIDELITY_PLACEHOLDER_MAX", "0.2")))
     args = ap.parse_args()
 
     out_root = Path(args.out_dir)
@@ -249,7 +252,44 @@ def main() -> int:
     rgb0 = np.asarray(obs.rgb, dtype=np.uint8)
     sky_ratio = _sky_ratio(rgb0)
     mean_luma = float(np.mean(rgb0.astype(np.float32)))
-    print(f"[V34D_VIEW_CHECK] ok={int(sky_ratio < 0.30 and mean_luma > 2.0)} sky_ratio={sky_ratio:.4f} mean_luma={mean_luma:.3f}", flush=True)
+
+    fidelity = backend.run_camera_fidelity_probe(frames=int(args.fidelity_frames))
+    f_mean_luma = float(fidelity.get("mean_luma", mean_luma))
+    f_placeholder = float(fidelity.get("placeholder_ratio", 1.0))
+    fidelity_ok = int(
+        (float(f_mean_luma) >= float(args.fidelity_luma_min))
+        and (float(f_placeholder) <= float(args.fidelity_placeholder_max))
+    )
+    # Enforce a strict gate: if fidelity is degenerate we fail before declaring
+    # the probe ready, so suite cannot pass with black/placeholder streams.
+    print(
+        f"[ISAAC_CAMERA_FIDELITY] ok={fidelity_ok} "
+        + ("" if fidelity_ok == 1 else "reason=degenerate_stream ")
+        + f"mean_luma={f_mean_luma:.3f} placeholder_ratio={f_placeholder:.3f}",
+        flush=True,
+    )
+    print(
+        f"[V34D_VIEW_CHECK] ok={fidelity_ok} mean_luma={f_mean_luma:.3f} sky_ratio={sky_ratio:.4f}",
+        flush=True,
+    )
+    mean_luma = f_mean_luma
+    (out_root / "camera_fidelity_v34f.json").write_text(
+        json.dumps(
+            {
+                "ok": int(fidelity_ok),
+                "thresholds": {
+                    "luma_min": float(args.fidelity_luma_min),
+                    "placeholder_max": float(args.fidelity_placeholder_max),
+                },
+                "fidelity": fidelity,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    if fidelity_ok != 1:
+        backend.close()
+        return 4
 
     node, flags, ros_reason = _init_ros2()
     print(
@@ -316,15 +356,16 @@ def main() -> int:
 
         rgb = np.asarray(obs.rgb, dtype=np.uint8)
         overlay = _draw_overlay(
-            rgb,
+            np.asarray(rgb, dtype=np.uint8),
             [
                 f"step={i}",
                 f"x={pose.x:.3f} z={pose.z:.3f} yaw={math.degrees(pose.yaw):.1f}",
                 f"stage=office.usd action={action}",
             ],
         )
-        Image.fromarray(overlay).save(cap_dir / f"rgb_{i:03d}.png")
-        rgbs.append(overlay)
+        Image.fromarray(rgb).save(cap_dir / f"rgb_{i:03d}.png")
+        Image.fromarray(overlay).save(cap_dir / f"overlay_rgb_{i:03d}.png")
+        rgbs.append(rgb)
         if obs.depth is not None:
             d = np.asarray(obs.depth, dtype=np.float32)
             if d.ndim == 3:
@@ -363,6 +404,7 @@ def main() -> int:
                 "must_prims": must_prims,
                 "sky_ratio": sky_ratio,
                 "mean_luma": mean_luma,
+                "camera_fidelity": fidelity,
                 "moved_m": moved,
                 "bridge_flags": flags,
                 "capture_dir": str(cap_dir),

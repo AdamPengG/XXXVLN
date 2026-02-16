@@ -45,19 +45,28 @@ def _load_depth(p: Path) -> Optional[np.ndarray]:
         return None
 
 
-def _pair_diffs(frames: List[np.ndarray]) -> Tuple[List[float], int]:
+def _pair_diffs(frames: List[np.ndarray]) -> Tuple[List[float], int, List[float]]:
     diffs: List[float] = []
     identical = 0
+    changed_ratio: List[float] = []
     for i in range(1, len(frames)):
         a = frames[i - 1]
         b = frames[i]
         if a.shape != b.shape:
             continue
-        delta = float(np.mean(np.abs(a - b)))
+        abs_delta = np.abs(a - b)
+        delta = float(np.mean(abs_delta))
         diffs.append(delta)
+        # Effective changed ratio guards against "text-only" changes where a tiny
+        # overlay area changes while the scene remains static.
+        if abs_delta.ndim == 3:
+            pix_changed = np.any(abs_delta > 2.0, axis=2)
+        else:
+            pix_changed = abs_delta > 2.0
+        changed_ratio.append(float(np.mean(pix_changed.astype(np.float32))))
         if delta <= 1e-9:
             identical += 1
-    return diffs, identical
+    return diffs, identical, changed_ratio
 
 
 def _depth_pair_diffs(depths: List[np.ndarray]) -> Tuple[List[float], int]:
@@ -87,6 +96,7 @@ def _write_reports(root: Path, report: dict) -> None:
     md.append(f"- identical_pairs: {report.get('identical_pairs', 0)}")
     md.append(f"- mean_rgb_diff: {report.get('mean_rgb_diff', 0.0):.6f}")
     md.append(f"- mean_depth_diff: {report.get('mean_depth_diff', 0.0):.6f}")
+    md.append(f"- effective_changed_ratio: {report.get('effective_changed_ratio', 0.0):.6f}")
     md.append(f"- rgb_files: {report.get('rgb_files', 0)}")
     md.append(f"- depth_files: {report.get('depth_files', 0)}")
     md.append("")
@@ -134,7 +144,7 @@ def main() -> int:
             continue
         rgb_files.append(p)
         rgb_frames.append(arr)
-    rgb_diffs, rgb_identical = _pair_diffs(rgb_frames)
+    rgb_diffs, rgb_identical, rgb_changed_ratio = _pair_diffs(rgb_frames)
 
     depth_files = _find_depth_npy_files(cap)
     depths = []
@@ -146,6 +156,7 @@ def main() -> int:
 
     mean_rgb = float(np.mean(rgb_diffs)) if rgb_diffs else 0.0
     mean_depth = float(np.mean(depth_diffs)) if depth_diffs else 0.0
+    effective_changed_ratio = float(np.mean(rgb_changed_ratio)) if rgb_changed_ratio else 0.0
     identical_pairs = int(max(rgb_identical, depth_identical))
     report = {
         "tag": str(args.tag or ""),
@@ -158,6 +169,7 @@ def main() -> int:
         "identical_pairs": int(identical_pairs),
         "mean_rgb_diff": float(mean_rgb),
         "mean_depth_diff": float(mean_depth),
+        "effective_changed_ratio": float(effective_changed_ratio),
     }
     _write_reports(cap, report)
 
@@ -165,12 +177,18 @@ def main() -> int:
     if str(args.write_gif).strip() not in {"0", "false", "False"}:
         gif_written = _try_gif(cap, rgb_files)
 
+    degenerate = int(effective_changed_ratio < 0.01 and mean_rgb < 1.0)
     print(
         f"[CAPTURE_MOTION] frames={len(rgb_frames)} identical_pairs={identical_pairs} "
         f"mean_rgb_diff={mean_rgb:.6f} mean_depth_diff={mean_depth:.6f} "
-        f"gif={int(gif_written)} tag={args.tag}",
+        f"effective_changed_ratio={effective_changed_ratio:.6f} "
+        f"degenerate={degenerate} "
+        + ("" if degenerate == 0 else "reason=text_only_or_frozen ")
+        + f"gif={int(gif_written)} tag={args.tag}",
         flush=True,
     )
+    if degenerate == 1:
+        return 3
     return 0
 
 

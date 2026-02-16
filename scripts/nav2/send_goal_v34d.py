@@ -220,13 +220,15 @@ def main() -> int:
 
         # Try multiple deterministic maneuvers so fallback still yields motion
         # when the robot is facing a wall at rejection time.
-        forward_dur = max(1.0, float(args.fallback_cmd_duration_s) * 0.6)
+        forward_dur = max(1.8, float(args.fallback_cmd_duration_s) * 0.8)
         maneuvers = [
             (float(args.fallback_cmd_linear_x), 0.0, forward_dur, "forward_probe"),
             (0.0, 0.8, 1.0, "turn_left"),
             (float(args.fallback_cmd_linear_x), 0.0, forward_dur, "forward_after_left"),
             (0.0, -1.2, 1.8, "turn_right"),
             (float(args.fallback_cmd_linear_x), 0.0, forward_dur, "forward_after_right"),
+            (0.0, 1.2, 0.9, "turn_left_final"),
+            (float(args.fallback_cmd_linear_x), 0.0, forward_dur + 0.7, "forward_final_push"),
         ]
 
         moved = 0.0

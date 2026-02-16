@@ -136,6 +136,12 @@ if [ ! -f "${READY_FILE}" ]; then
   fail_suite "probe_not_ready"
 fi
 cat "${LOG_DIR}/isaac_probe_v34e.log" >> "${SUITE_LOG}" || true
+if ! rg -q "\[ISAAC_STEP_CFG\].*step_render=1.*step_render_every_n=1" "${SUITE_LOG}"; then
+  fail_suite "isaac_step_cfg_missing_or_invalid"
+fi
+if ! rg -q "\[ISAAC_CAMERA_FIDELITY\] ok=1" "${SUITE_LOG}"; then
+  fail_suite "camera_fidelity_failed"
+fi
 
 # 6) Nav2 bringup + topic checks
 if ! run_and_log bash scripts/nav2/bringup_nav2_office_v34d.sh; then
@@ -145,7 +151,30 @@ if ! run_and_log bash scripts/nav2/ros2_topic_check_v34d.sh; then
   fail_suite "ros2_topic_check_failed"
 fi
 
-# 7) send a goal at least 1m away from current odom and verify moved_m from sender.
+# 7) cmd_vel drive proof (hard motion check)
+CMDVEL_LOG="${LOG_DIR}/cmd_vel_drive_v34e.log"
+: > "${CMDVEL_LOG}"
+if ! bash scripts/isaac/cmd_vel_drive_smoke_v34e.sh > "${CMDVEL_LOG}" 2>&1; then
+  cat "${CMDVEL_LOG}" | tee -a "${SUITE_LOG}"
+  fail_suite "cmd_vel_drive_failed"
+fi
+cat "${CMDVEL_LOG}" | tee -a "${SUITE_LOG}"
+CMDVEL_MOVED="$(python3 - <<'PY' "${CMDVEL_LOG}"
+import re,sys
+text=open(sys.argv[1],'r',encoding='utf-8').read()
+m=re.search(r'moved_m=([0-9.]+)', text)
+print(float(m.group(1)) if m else 0.0)
+PY
+)"
+if ! python3 - <<'PY' "${CMDVEL_MOVED}" >/dev/null
+import sys
+raise SystemExit(0 if float(sys.argv[1]) > 0.5 else 1)
+PY
+then
+  fail_suite "cmd_vel_drive_too_small"
+fi
+
+# 8) send a goal at least 1m away from current odom and verify moved_m from sender.
 GOAL_LOG="${LOG_DIR}/send_goal_v34e.log"
 : > "${GOAL_LOG}"
 MAP_YAML_ABS="$(python3 - <<'PY' "${V34D_MAP_YAML}"
@@ -181,31 +210,10 @@ if [ "${GOAL_OK}" != "1" ]; then
   fail_suite "goal_motion_too_small"
 fi
 
-# 8) cmd_vel drive proof (hard motion check)
-CMDVEL_LOG="${LOG_DIR}/cmd_vel_drive_v34e.log"
-: > "${CMDVEL_LOG}"
-if ! bash scripts/isaac/cmd_vel_drive_smoke_v34e.sh > "${CMDVEL_LOG}" 2>&1; then
-  cat "${CMDVEL_LOG}" | tee -a "${SUITE_LOG}"
-  fail_suite "cmd_vel_drive_failed"
-fi
-cat "${CMDVEL_LOG}" | tee -a "${SUITE_LOG}"
-CMDVEL_MOVED="$(python3 - <<'PY' "${CMDVEL_LOG}"
-import re,sys
-text=open(sys.argv[1],'r',encoding='utf-8').read()
-m=re.search(r'moved_m=([0-9.]+)', text)
-print(float(m.group(1)) if m else 0.0)
-PY
-)"
-if ! python3 - <<'PY' "${CMDVEL_MOVED}" >/dev/null
-import sys
-raise SystemExit(0 if float(sys.argv[1]) > 0.5 else 1)
-PY
-then
-  fail_suite "cmd_vel_drive_too_small"
-fi
-
 # 9) optional capture motion + view sanity
-run_and_log bash scripts/tools/check_capture_motion.sh --capture_dir "${CAP_DIR}" --tag v34e_nav2_office_phys --write_gif 1
+if ! run_and_log bash scripts/tools/check_capture_motion.sh --capture_dir "${CAP_DIR}" --tag v34e_nav2_office_phys --write_gif 1; then
+  fail_suite "capture_motion_degenerate"
+fi
 MEAN_LUMA="$(python3 - <<'PY' "${CAP_DIR}"
 import sys
 from pathlib import Path
