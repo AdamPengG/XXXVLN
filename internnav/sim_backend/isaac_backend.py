@@ -70,6 +70,11 @@ class IsaacSimBackend(SimBackend):
         self._rgb_capture = bool(int(os.environ.get("ISAAC_RGB_CAPTURE", "0")))
         self._skip_world_step = bool(int(os.environ.get("ISAAC_SKIP_WORLD_STEP", "0")))
         self._render = bool(int(os.environ.get("ISAAC_RENDER", "0")))
+        # v33c: always render sensor frames on step by default so RGB/depth
+        # are refreshed with pose updates during PlanB rollouts.
+        self._step_render = bool(int(os.environ.get("ISAAC_STEP_RENDER", "1")))
+        self._step_render_every_n = max(1, int(os.environ.get("ISAAC_STEP_RENDER_EVERY_N", "1")))
+        self._obs_step_idx = 0
         self._minimal = bool(int(os.environ.get("ISAAC_MINIMAL", "0")))
         self._camera_cfg: IsaacCameraConfig = build_camera_config(self.scene_cfg)
         self._camera_cfg_info: Dict[str, object] = {}
@@ -80,6 +85,8 @@ class IsaacSimBackend(SimBackend):
             self._minimal = False
             self._render = True
             self._skip_world_step = False
+            self._step_render = True
+            self._step_render_every_n = 1
 
         bounds = self.scene_cfg.get("bounds", [-6.0, 6.0, -6.0, 6.0])
         if not isinstance(bounds, list) or len(bounds) != 4:
@@ -201,6 +208,7 @@ class IsaacSimBackend(SimBackend):
             # Keep pipeline alive with synthetic RGB fallback.
             self._minimal = True
             self._render = False
+            self._step_render = False
             self._skip_world_step = True
             return
 
@@ -340,8 +348,14 @@ class IsaacSimBackend(SimBackend):
 
         self._world.reset()
         if not self._skip_world_step:
+            warm_render = bool(self._render or self._step_render)
             for _ in range(3):
-                self._world.step(render=self._render)
+                self._world.step(render=warm_render)
+        print(
+            f"[ISAAC_STEP_CFG] render_legacy={int(self._render)} step_render={int(self._step_render)} "
+            f"step_render_every_n={int(self._step_render_every_n)} skip_world_step={int(self._skip_world_step)}",
+            flush=True,
+        )
 
     def _set_pose(self, xyz: np.ndarray, yaw: float) -> None:
         self._pose_xyz = np.asarray(xyz, dtype=np.float32)
@@ -595,12 +609,23 @@ class IsaacSimBackend(SimBackend):
         return rgb, depth
 
     def _build_obs(self, info: Optional[Dict[str, object]] = None) -> Obs:
+        world_stepped = 0
+        sensor_rendered = 0
         if self._world is not None and not self._skip_world_step:
-            self._world.step(render=self._render)
-        elif self._world is not None and self._rgb_capture:
-            # v26: even if skip_world_step was originally set, RGB capture
-            # forces a render pass so the camera has fresh pixels.
+            self._obs_step_idx += 1
+            periodic_render = bool(
+                self._step_render and ((self._obs_step_idx % int(self._step_render_every_n)) == 0)
+            )
+            do_render = bool(self._render or periodic_render)
+            self._world.step(render=do_render)
+            world_stepped = 1
+            sensor_rendered = int(do_render)
+        elif self._world is not None and (self._rgb_capture or self._step_render):
+            # Even if world stepping is skipped, a render pass is needed to avoid
+            # stale camera pixels in debug/fidelity flows.
             self._world.step(render=True)
+            world_stepped = 1
+            sensor_rendered = 1
         rgb, depth = self._read_camera_rgbd()
         obs = Obs(
             rgb=np.asarray(rgb, dtype=np.uint8),
@@ -616,6 +641,9 @@ class IsaacSimBackend(SimBackend):
             info=dict(info or {}),
         )
         obs.info["renderer_used"] = str(self._renderer_used)
+        obs.info["sensor_rendered"] = int(sensor_rendered)
+        obs.info["world_stepped"] = int(world_stepped)
+        obs.info["step_render_every_n"] = int(self._step_render_every_n)
         if len(self._camera_cfg_info) > 0:
             obs.info["camera"] = dict(self._camera_cfg_info)
         if len(self._camera_fidelity_info) > 0:
