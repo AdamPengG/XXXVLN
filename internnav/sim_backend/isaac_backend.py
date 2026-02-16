@@ -80,6 +80,8 @@ class IsaacSimBackend(SimBackend):
         self._camera_cfg_info: Dict[str, object] = {}
         self._camera_fidelity_info: Dict[str, object] = {}
         self._camera_probe_done = False
+        self._stage_up_axis = "Y"
+        self._camera_height_m = float(os.environ.get("ISAAC_CAMERA_HEIGHT_M", "1.5"))
         # v26: RGB capture forces world init + render
         if self._rgb_capture:
             self._minimal = False
@@ -246,6 +248,7 @@ class IsaacSimBackend(SimBackend):
 
     def _init_isaac_world(self) -> None:
         from omni.isaac.core import World  # type: ignore
+        from pxr import UsdGeom  # type: ignore
 
         if self._usd_resolved and os.path.isfile(self._usd_resolved):
             try:
@@ -256,6 +259,12 @@ class IsaacSimBackend(SimBackend):
                 pass
 
         self._world = World(physics_dt=1.0 / 60.0, rendering_dt=1.0 / 60.0)
+        try:
+            stage = self._world.stage
+            if stage is not None:
+                self._stage_up_axis = str(UsdGeom.GetStageUpAxis(stage)).upper()
+        except Exception:
+            self._stage_up_axis = "Y"
         try:
             self._world.scene.add_default_ground_plane()
         except Exception:
@@ -301,7 +310,7 @@ class IsaacSimBackend(SimBackend):
                 prim_path="/World/TopoCamera",
                 frequency=20,
                 resolution=(w, h),
-                position=np.array([0.0, 1.5, 0.0], dtype=np.float32),
+                position=np.array([0.0, float(self._camera_height_m), 0.0], dtype=np.float32),
                 orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
             )
             self._camera.initialize()
@@ -357,16 +366,55 @@ class IsaacSimBackend(SimBackend):
             flush=True,
         )
 
+    @staticmethod
+    def _quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+        # Quaternion multiply in wxyz convention.
+        w1, x1, y1, z1 = [float(v) for v in q1]
+        w2, x2, y2, z2 = [float(v) for v in q2]
+        return np.array(
+            [
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            ],
+            dtype=np.float32,
+        )
+
     def _set_pose(self, xyz: np.ndarray, yaw: float) -> None:
         self._pose_xyz = np.asarray(xyz, dtype=np.float32)
         self._yaw = _wrap_pi(float(yaw))
         if self._camera is None:
             return
-        pos = np.array([float(self._pose_xyz[0]), 1.5, float(self._pose_xyz[2])], dtype=np.float32)
-        qw = float(math.cos(self._yaw / 2.0))
-        qy = float(math.sin(self._yaw / 2.0))
-        quat_wxyz = np.array([qw, 0.0, qy, 0.0], dtype=np.float32)
-        quat_xyzw = np.array([0.0, qy, 0.0, qw], dtype=np.float32)
+        if str(self._stage_up_axis).upper().startswith("Z"):
+            pos = np.array(
+                [
+                    float(self._pose_xyz[0]),
+                    float(self._pose_xyz[2]),
+                    float(self._camera_height_m),
+                ],
+                dtype=np.float32,
+            )
+            # USD camera looks along local -Z; for Z-up stages rotate camera so
+            # forward lies in XY plane, then apply yaw about world Z axis.
+            q_base = np.array(
+                [float(math.cos(-math.pi / 4.0)), float(math.sin(-math.pi / 4.0)), 0.0, 0.0],
+                dtype=np.float32,
+            )
+            q_yaw = np.array(
+                [float(math.cos(self._yaw / 2.0)), 0.0, 0.0, float(math.sin(self._yaw / 2.0))],
+                dtype=np.float32,
+            )
+            quat_wxyz = self._quat_mul(q_yaw, q_base)
+        else:
+            pos = np.array(
+                [float(self._pose_xyz[0]), float(self._camera_height_m), float(self._pose_xyz[2])],
+                dtype=np.float32,
+            )
+            qw = float(math.cos(self._yaw / 2.0))
+            qy = float(math.sin(self._yaw / 2.0))
+            quat_wxyz = np.array([qw, 0.0, qy, 0.0], dtype=np.float32)
+        quat_xyzw = np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float32)
         try:
             self._camera.set_world_pose(position=pos, orientation=quat_wxyz)
         except Exception:
