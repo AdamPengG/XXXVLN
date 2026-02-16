@@ -9,6 +9,8 @@ import io
 import json
 import math
 import os
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -122,6 +124,66 @@ def _action_name_to_id(action_name: str) -> Optional[int]:
         "RIGHT": 3,
     }
     return mapping.get(tok, None)
+
+
+def _resolve_room_goal_pose(room_val: Any) -> Tuple[Optional[np.ndarray], float]:
+    yaw_deg = 0.0
+    if not isinstance(room_val, dict):
+        return None, yaw_deg
+    anchors = room_val.get("anchor_poses", [])
+    if isinstance(anchors, list) and len(anchors) > 0 and isinstance(anchors[0], dict):
+        p = anchors[0]
+        x = float(p.get("x", 0.0))
+        y = float(p.get("y", 0.0))
+        z = float(p.get("z", 0.0))
+        yaw_deg = float(p.get("yaw_deg", p.get("yaw", 0.0)))
+        return np.array([x, y, z], dtype=np.float32), float(yaw_deg)
+    region = room_val.get("region", {})
+    if isinstance(region, dict) and str(region.get("type", "")).lower() == "aabb":
+        mn = region.get("min", {})
+        mx = region.get("max", {})
+        if isinstance(mn, dict) and isinstance(mx, dict):
+            x = 0.5 * (float(mn.get("x", 0.0)) + float(mx.get("x", 0.0)))
+            z = 0.5 * (float(mn.get("z", 0.0)) + float(mx.get("z", 0.0)))
+            y = 0.0
+            yaw_deg = float(room_val.get("yaw_deg", 0.0))
+            return np.array([x, y, z], dtype=np.float32), float(yaw_deg)
+    return None, yaw_deg
+
+
+def _resolve_object_goal_pose(object_val: Any, scene_cfg: Dict[str, Any]) -> Tuple[Optional[np.ndarray], float, str]:
+    if not isinstance(object_val, dict):
+        return None, 0.0, "object_value_not_dict"
+    approach = object_val.get("approach_pose", {})
+    if isinstance(approach, dict):
+        if all(k in approach for k in ("x", "z")):
+            x = float(approach.get("x", 0.0))
+            y = float(approach.get("y", 0.0))
+            z = float(approach.get("z", 0.0))
+            yaw_deg = float(approach.get("yaw_deg", 0.0))
+            return np.array([x, y, z], dtype=np.float32), float(yaw_deg), "query.approach_pose"
+    query = object_val.get("query", {})
+    if not isinstance(query, dict):
+        return None, 0.0, "object_query_missing"
+    name_contains = str(query.get("name_contains", "")).strip().lower()
+    cls_equals = str(query.get("class_equals", "")).strip().lower()
+    anchors = scene_cfg.get("object_anchors", []) if isinstance(scene_cfg, dict) else []
+    if isinstance(anchors, list):
+        for item in anchors:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", item.get("label", ""))).strip().lower()
+            cls = str(item.get("class", "")).strip().lower()
+            if name_contains and name_contains not in name:
+                continue
+            if cls_equals and cls_equals != cls:
+                continue
+            x = float(item.get("x", 0.0))
+            y = float(item.get("y", 0.0))
+            z = float(item.get("z", 0.0))
+            yaw_deg = float(item.get("yaw_deg", 0.0))
+            return np.array([x, y, z], dtype=np.float32), float(yaw_deg), "scene_cfg.object_anchors"
+    return None, 0.0, "object_pose_not_found"
 
 
 def _encode_rgb_jpeg_b64(rgb: np.ndarray, quality: int = 85) -> Tuple[str, int]:
@@ -458,9 +520,12 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
         flush=True,
     )
 
+    scene_cfg_for_goal = _load_scene_cfg(args.isaac_config, args.scene_id) if str(args.backend).strip().lower() == "isaac" else {}
     goal_spec = None
     goal_pose_override: Optional[np.ndarray] = None
+    goal_pose_yaw_deg_override: float = 0.0
     goal_node_override: Optional[int] = None
+    goal_invalid_reason: Optional[str] = None
     query_text = str(args.query)
     if query_text.strip().startswith("{"):
         try:
@@ -484,9 +549,37 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                 gy = float(gval.get("y", 0.0))
                 gz = float(gval.get("z", 0.0))
                 goal_pose_override = np.array([gx, gy, gz], dtype=np.float32)
+                goal_pose_yaw_deg_override = float(gval.get("yaw_deg", gval.get("yaw", 0.0)))
             print(f"[TOPO_GOAL_SPEC] type=pose value={gval}", flush=True)
+        elif gtype == "room":
+            room_pose, room_yaw = _resolve_room_goal_pose(gval)
+            if room_pose is None:
+                goal_invalid_reason = "invalid_room_goal"
+                print(f"[TOPO_GOAL_SPEC] type=room value={gval} resolved=0 reason={goal_invalid_reason}", flush=True)
+            else:
+                goal_pose_override = room_pose
+                goal_pose_yaw_deg_override = float(room_yaw)
+                print(f"[TOPO_GOAL_SPEC] type=room value={gval} resolved=1", flush=True)
+        elif gtype == "object":
+            obj_pose, obj_yaw, src = _resolve_object_goal_pose(gval, scene_cfg_for_goal)
+            if obj_pose is None:
+                goal_invalid_reason = f"invalid_object_goal:{src}"
+                print(
+                    f"[TOPO_GOAL_SPEC] type=object value={gval} resolved=0 reason={goal_invalid_reason}",
+                    flush=True,
+                )
+            else:
+                goal_pose_override = obj_pose
+                goal_pose_yaw_deg_override = float(obj_yaw)
+                print(
+                    f"[TOPO_GOAL_SPEC] type=object value={gval} resolved=1 source={src}",
+                    flush=True,
+                )
 
-    if goal_node_override is None:
+    if goal_pose_override is not None and goal_node_override is None:
+        gnode, _ = _nearest_node(goal_pose_override, graph)
+        topk = [(int(gnode), 1.0)]
+    elif goal_node_override is None:
         query_embed = text_embedder.embed_text(query_text)
         topk = retrieve_goal_topk(query_embed, clip_embeds_norm, idx_to_node, topk=max(3, int(args.goal_topk)))
         if len(topk) == 0:
@@ -536,12 +629,18 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
         except Exception:
             camera_info = {}
     planb_policy = str(getattr(args, "planb_policy", "topo")).strip().lower()
-    if planb_policy not in {"topo", "dualvln_rpc"}:
+    if planb_policy not in {"topo", "dualvln_rpc", "nav2"}:
         planb_policy = "topo"
     rpc_client: Optional[DualVlnRpcClient] = None
     rpc_fallback = str(getattr(args, "dualvln_rpc_fallback", "topo")).strip().lower()
     rpc_failures = 0
     rpc_successes = 0
+    nav2_status = "NOT_REQUESTED"
+    nav2_reason = ""
+    nav2_time_s = 0.0
+    nav2_fallback = str(getattr(args, "nav2_fallback", "topo")).strip().lower()
+    nav2_invoked = 0
+    nav2_pre_success = False
     if planb_policy == "dualvln_rpc":
         rpc_client = DualVlnRpcClient(
             server_url=str(args.dualvln_server_url),
@@ -555,12 +654,58 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             flush=True,
         )
         print(f"[GPU_SPLIT] isaac_gpu={isaac_gpu} dualvln_gpu={dual_gpu}", flush=True)
+    elif planb_policy == "nav2":
+        print(
+            f"[PLANB_POLICY] name=nav2 ok=1 goal_frame={str(getattr(args, 'nav2_goal_frame', 'map'))} "
+            f"send_goal_script={str(args.nav2_send_goal_script)} fallback={nav2_fallback}",
+            flush=True,
+        )
+        print("[GPU_SPLIT] isaac_gpu=0 dualvln_gpu=unused", flush=True)
     else:
         print(f"[PLANB_POLICY] name=topo ok=1", flush=True)
 
     goal_pos = np.array(graph.nodes[goal_node].position, dtype=np.float32)
     if goal_pose_override is not None:
         goal_pos = np.array(goal_pose_override, dtype=np.float32)
+
+    if goal_invalid_reason is not None:
+        fail_result = {
+            "run_id": str(args.run_id),
+            "scene_id": str(args.scene_id),
+            "query": str(args.query),
+            "backend": str(args.backend),
+            "backend_mode": str(backend_mode),
+            "renderer_used": str(renderer_used),
+            "success": False,
+            "fail_reason": str(goal_invalid_reason),
+            "terminated_by": "early_stop",
+            "success_by": None,
+            "steps_used": 0,
+            "final_dist_to_goal_node": -1.0,
+            "goal_node": int(goal_node),
+            "goal_score": float(goal_score),
+            "action_histogram": {"STOP": 0, "FWD": 0, "LEFT": 0, "RIGHT": 0},
+            "avg_loc_conf": 0.0,
+            "watchdog_trigger_count": 0,
+            "relocalize_reset_count": 0,
+            "doorway_burst_count": 0,
+            "v33a_stuck_trigger_count": 0,
+            "v33a_recovery_count": 0,
+            "v33a_stuck_fail": 0,
+            "v33b": {"enabled": int(bool(args.v33b_enable)), "depth_ready": 0, "depth_disabled": 0},
+            "policy": {"name": str(planb_policy), "rpc_server_url": "", "rpc_successes": 0, "rpc_failures": 0, "rpc_fallback": ""},
+            "belief_entropy_summary": {"mean": 1.0, "max": 1.0, "min": 1.0},
+            "fill_triggers": 0,
+            "camera": camera_info,
+        }
+        print(f"[TOPO_NAV_FAIL] reason={goal_invalid_reason} steps=0", flush=True)
+        result_path = os.path.join(args.out_dir, f"RESULT_{args.run_id}.json")
+        with open(result_path, "w") as f:
+            json.dump(fail_result, f, indent=2)
+        with open(os.path.join(args.out_dir, f"path_poses_{args.run_id}.json"), "w") as f:
+            json.dump({"run_id": str(args.run_id), "scene_id": str(args.scene_id), "query": str(args.query), "goal_node": int(goal_node), "poses": []}, f, indent=2)
+        backend.close()
+        return fail_result
 
     planner_waypoints: List[Tuple[float, float]] = []
     planner_ok = False
@@ -613,6 +758,70 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             f"ringbuf={int(args.debug_ringbuf_steps)} stride={int(debug_frame_stride)}",
             flush=True,
         )
+
+    if planb_policy == "nav2":
+        nav2_invoked = 1
+        nav2_x = float(goal_pos[0])
+        nav2_y = float(goal_pos[1])
+        nav2_yaw = float(goal_pose_yaw_deg_override)
+        cmd = [
+            str(sys.executable),
+            str(args.nav2_send_goal_script),
+            "--x",
+            f"{nav2_x:.3f}",
+            "--y",
+            f"{nav2_y:.3f}",
+            "--yaw_deg",
+            f"{nav2_yaw:.3f}",
+            "--frame",
+            str(args.nav2_goal_frame),
+            "--timeout_s",
+            f"{float(args.nav2_timeout_s):.2f}",
+            "--goal_id",
+            str(args.run_id),
+        ]
+        t_nav0 = time.time()
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=float(args.nav2_timeout_s) + 2.0,
+                check=False,
+            )
+            nav2_time_s = float(time.time() - t_nav0)
+            out_text = (proc.stdout or "").strip()
+            err_text = (proc.stderr or "").strip()
+            if out_text:
+                for ln in out_text.splitlines():
+                    print(ln, flush=True)
+            if err_text:
+                print(f"[V34B_NAV2_ERR] run={args.run_id} stderr={err_text[:240]}", flush=True)
+            if proc.returncode == 0:
+                nav2_status = "SUCCEEDED"
+                nav2_reason = "navigate_to_pose"
+                print(
+                    f"[V34B_NAV2_POLICY] run={args.run_id} status=SUCCEEDED time_s={nav2_time_s:.3f}",
+                    flush=True,
+                )
+                nav2_pre_success = True
+            else:
+                nav2_status = "FAILED"
+                nav2_reason = f"send_goal_rc_{proc.returncode}"
+                print(
+                    f"[V34B_NAV2_POLICY] run={args.run_id} status=FAILED time_s={nav2_time_s:.3f} "
+                    f"reason={nav2_reason} fallback={nav2_fallback}",
+                    flush=True,
+                )
+        except subprocess.TimeoutExpired:
+            nav2_time_s = float(time.time() - t_nav0)
+            nav2_status = "TIMEOUT"
+            nav2_reason = "send_goal_timeout"
+            print(
+                f"[V34B_NAV2_POLICY] run={args.run_id} status=TIMEOUT time_s={nav2_time_s:.3f} "
+                f"reason={nav2_reason} fallback={nav2_fallback}",
+                flush=True,
+            )
 
     map_node, _ = _nearest_node(np.array([obs.pose.x, obs.pose.y, obs.pose.z], dtype=np.float32), graph)
     path_nodes = dijkstra_path(graph.edges, int(map_node), int(goal_node))
@@ -717,6 +926,12 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
     last_entropy = 1.0
     last_topk: List[Tuple[int, float]] = []
     last_collision: Optional[bool] = None
+
+    if nav2_pre_success:
+        success = True
+        terminated_by = "success_stop"
+        success_by = "oracle"
+        done = True
 
     try:
         while not done:
@@ -958,6 +1173,14 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                         f"[DUALVLN_RPC] ok=0 step={step} reason={rpc_reason} fallback_action={fallback_action_name}",
                         flush=True,
                     )
+
+            if planb_policy == "nav2" and nav2_status in {"FAILED", "TIMEOUT"} and nav2_fallback == "stop":
+                base_action = 0
+                base_action_name = "STOP"
+                print(
+                    f"[V34B_NAV2_POLICY] run={args.run_id} step={step} fallback_action=STOP reason={nav2_reason}",
+                    flush=True,
+                )
 
             action = int(base_action)
             action_name = str(base_action_name)
@@ -1507,6 +1730,11 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
             "rpc_successes": int(rpc_successes),
             "rpc_failures": int(rpc_failures),
             "rpc_fallback": str(rpc_fallback),
+            "nav2_invoked": int(nav2_invoked),
+            "nav2_status": str(nav2_status),
+            "nav2_reason": str(nav2_reason),
+            "nav2_time_s": float(nav2_time_s),
+            "nav2_fallback": str(nav2_fallback),
         },
         "belief_entropy_summary": {
             "mean": float(last_entropy),
@@ -1659,7 +1887,7 @@ def main() -> None:
         "--planb_policy",
         type=str,
         default=os.environ.get("PLANB_POLICY", "topo"),
-        choices=["topo", "dualvln_rpc"],
+        choices=["topo", "dualvln_rpc", "nav2"],
     )
     ap.add_argument(
         "--dualvln_server_url",
@@ -1675,6 +1903,27 @@ def main() -> None:
         "--dualvln_rpc_fallback",
         type=str,
         default=os.environ.get("DUALVLN_RPC_FALLBACK", "topo"),
+        choices=["topo", "stop"],
+    )
+    ap.add_argument(
+        "--nav2_send_goal_script",
+        type=str,
+        default=os.environ.get("NAV2_SEND_GOAL_SCRIPT", "scripts/nav2/send_goal_v34b.py"),
+    )
+    ap.add_argument(
+        "--nav2_timeout_s",
+        type=float,
+        default=float(os.environ.get("NAV2_TIMEOUT_S", "45")),
+    )
+    ap.add_argument(
+        "--nav2_goal_frame",
+        type=str,
+        default=os.environ.get("NAV2_GOAL_FRAME", "map"),
+    )
+    ap.add_argument(
+        "--nav2_fallback",
+        type=str,
+        default=os.environ.get("NAV2_FALLBACK", "topo"),
         choices=["topo", "stop"],
     )
     ap.add_argument("--controller_mode", type=str, default="bearing", choices=["bearing", "follower", "waypoint_follow"])

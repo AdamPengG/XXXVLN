@@ -1,0 +1,24 @@
+global:
+  dt_action: 0.5
+  max_steps: 80
+  node_reach_thresh: 0.8
+
+scenes:
+  - scene_id: "office_localized"
+    usd_path: "/home/peng/DualVLN/runs/topo_mvp/v28_isaac/assets_local/Assets/Isaac/5.1/Isaac/Environments/Office/office.usd"
+    usd_hint: "office.usd"
+    bounds: [-6.0, 6.0, -6.0, 6.0]
+    cam_w: 1280
+    cam_h: 720
+    cam_fov_deg: 90.0
+    cam_near: 0.05
+    cam_far: 50.0
+    cam_auto_exposure: 0
+    cam_exposure: 1.0
+    cam_aspect_policy: "locked_w_over_h"
+    starts:
+      - {x: -2.8, y: 0.0, z: -2.5, yaw_deg: 25}
+      - {x: 2.2, y: 0.0, z: -1.8, yaw_deg: 145}
+    object_anchors:
+      - {name: "Printer", class: "printer", x: -0.8, y: 0.0, z: 0.6, yaw_deg: 20}
+      - {name: "ReceptionDesk", class: "desk", x: 1.4, y: 0.0, z: -1.1, yaw_deg: -90}
