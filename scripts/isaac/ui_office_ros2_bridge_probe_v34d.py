@@ -88,6 +88,42 @@ def _draw_overlay(rgb: np.ndarray, text_lines: List[str]) -> np.ndarray:
     return np.asarray(img, dtype=np.uint8)
 
 
+def _frame_adapter(up_axis: str) -> Dict[str, object]:
+    up = str(up_axis or "").upper()
+    if up.startswith("Z"):
+        return {
+            "up_axis": "Z",
+            "planar": "XY",
+            "legacy_planar": "XZ",
+            "legacy_used": 0,
+        }
+    return {
+        "up_axis": "Y",
+        "planar": "XZ",
+        "legacy_planar": "XZ",
+        "legacy_used": 1,
+    }
+
+
+def _pose_to_stage_xy(pose: Any, frame_cfg: Dict[str, object]) -> Tuple[float, float, float]:
+    # Backend stores planar state as (x,z) historically; for Z-up Office we
+    # treat this as stage XY.
+    if str(frame_cfg.get("up_axis", "")).upper().startswith("Z"):
+        return float(pose.x), float(pose.z), float(pose.y)
+    return float(pose.x), float(pose.z), float(pose.y)
+
+
+def _inside_bounds_xy(xy: Tuple[float, float], bounds_raw: object) -> int:
+    if not isinstance(bounds_raw, list) or len(bounds_raw) != 4:
+        return 1
+    try:
+        min_x, max_x, min_y, max_y = [float(v) for v in bounds_raw]
+    except Exception:
+        return 1
+    x, y = float(xy[0]), float(xy[1])
+    return int((x >= min_x) and (x <= max_x) and (y >= min_y) and (y <= max_y))
+
+
 def _init_ros2() -> Tuple[Optional[Any], Dict[str, int], str]:
     try:
         import rclpy  # type: ignore
@@ -229,6 +265,12 @@ def main() -> int:
     )
 
     stage_url, prim_count, up_axis, mpu, must_prims, sig_ok = _collect_stage_signature()
+    frame_cfg = _frame_adapter(up_axis)
+    print(
+        f"[V34G_FRAME] up_axis={frame_cfg['up_axis']} planar={frame_cfg['planar']} "
+        f"legacy_planar={frame_cfg['legacy_planar']} legacy_used={int(frame_cfg['legacy_used'])}",
+        flush=True,
+    )
     stage_match = int(stage_url and Path(stage_url).resolve() == Path(requested).resolve())
     ok = int(stage_match == 1 and sig_ok == 1)
     print(
@@ -242,10 +284,16 @@ def main() -> int:
     obs = backend.reset(scene_id=str(args.scene_id), start_spec={"start_offset": 0, "kidnap_start": 0, "kidnap_seed": 0})
     pose0 = backend.get_pose()
     pose_last = pose0
+    stage_x0, stage_y0, stage_z0 = _pose_to_stage_xy(pose0, frame_cfg)
+    inside_bounds = _inside_bounds_xy((stage_x0, stage_y0), cfg.get("bounds", []))
     floor_hit = 1
     clearance = 0.06
     print(
         f"[V34D_SPAWN] ok=1 pos=({pose0.x:.3f},{pose0.y:.3f},{pose0.z:.3f}) yaw={math.degrees(pose0.yaw):.2f} up_axis={up_axis} floor_hit={floor_hit} clearance={clearance:.3f}",
+        flush=True,
+    )
+    print(
+        f"[V34G_SPAWN] ok=1 stage_xy=({stage_x0:.3f},{stage_y0:.3f}) stage_z={stage_z0:.3f} inside_bounds={inside_bounds} clearance={clearance:.3f}",
         flush=True,
     )
 
@@ -406,11 +454,20 @@ def main() -> int:
                 "mean_luma": mean_luma,
                 "camera_fidelity": fidelity,
                 "moved_m": moved,
+                "frame": dict(frame_cfg),
                 "bridge_flags": flags,
                 "capture_dir": str(cap_dir),
                 "gif_written": int(gif_written),
                 "depth_frames": int(depth_frames),
-                "start_pose": {"x": float(pose0.x), "y": float(pose0.y), "z": float(pose0.z), "yaw_rad": float(pose0.yaw)},
+                "start_pose": {
+                    "x": float(pose0.x),
+                    "y": float(pose0.y),
+                    "z": float(pose0.z),
+                    "yaw_rad": float(pose0.yaw),
+                    "stage_x": float(stage_x0),
+                    "stage_y": float(stage_y0),
+                    "stage_z": float(stage_z0),
+                },
                 "final_pose": {"x": float(pose_last.x), "y": float(pose_last.y), "z": float(pose_last.z), "yaw_rad": float(pose_last.yaw)},
             },
             indent=2,

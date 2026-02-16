@@ -220,7 +220,7 @@ def main() -> int:
 
         # Try multiple deterministic maneuvers so fallback still yields motion
         # when the robot is facing a wall at rejection time.
-        forward_dur = max(1.8, float(args.fallback_cmd_duration_s) * 0.8)
+        forward_dur = max(2.4, float(args.fallback_cmd_duration_s))
         maneuvers = [
             (float(args.fallback_cmd_linear_x), 0.0, forward_dur, "forward_probe"),
             (0.0, 0.8, 1.0, "turn_left"),
@@ -228,7 +228,8 @@ def main() -> int:
             (0.0, -1.2, 1.8, "turn_right"),
             (float(args.fallback_cmd_linear_x), 0.0, forward_dur, "forward_after_right"),
             (0.0, 1.2, 0.9, "turn_left_final"),
-            (float(args.fallback_cmd_linear_x), 0.0, forward_dur + 0.7, "forward_final_push"),
+            (float(args.fallback_cmd_linear_x), 0.0, forward_dur + 1.2, "forward_final_push"),
+            (float(args.fallback_cmd_linear_x), 0.0, forward_dur + 1.2, "forward_extra_push"),
         ]
 
         moved = 0.0
@@ -244,7 +245,7 @@ def main() -> int:
                 f"[V34D_GOAL_FALLBACK] step={attempts} tag={tag} moved_m={moved:.3f}",
                 flush=True,
             )
-            if moved > 0.5:
+            if moved > 1.05:
                 break
 
         _stop_and_spin(0.6)
@@ -361,9 +362,9 @@ def main() -> int:
             reason = "goal_rejected"
             if int(args.fallback_cmdvel) == 1:
                 moved = _fallback_cmdvel_drive()
-                if moved > 0.5:
+                if moved > 1.0:
                     status = "GOAL_REJECTED_FALLBACK_CMDVEL"
-            reached = 1 if moved > 0.5 else 0
+            reached = 1 if moved > 1.0 else 0
             print(
                 f"[V34D_GOAL] sent=1 x={args.x:.3f} y={args.y:.3f} yaw={args.yaw_deg:.3f} status={status} reached={reached} time_s={dt:.3f} reason={reason} moved_m={moved:.3f}",
                 flush=True,
@@ -385,8 +386,8 @@ def main() -> int:
                     x1 = float(node.last_odom.pose.pose.position.x)
                     y1 = float(node.last_odom.pose.pose.position.y)
                     moved = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
-            status = "TIMEOUT_MOVED" if moved >= 0.20 else "TIMEOUT_PROXY"
-            reached = 1 if moved >= 0.20 else 0
+            status = "TIMEOUT_MOVED" if moved >= 1.0 else "TIMEOUT_PROXY"
+            reached = 1 if moved >= 1.0 else 0
             print(
                 f"[V34D_GOAL] sent=1 x={args.x:.3f} y={args.y:.3f} yaw={args.yaw_deg:.3f} status={status} reached={reached} time_s={dt:.3f} moved_m={moved:.3f}",
                 flush=True,

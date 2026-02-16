@@ -113,6 +113,11 @@ def main() -> int:
 
         overlay_stage = Usd.Stage.CreateNew(str(out_usd))
         overlay_stage.SetMetadata("metersPerUnit", 1.0)
+        try:
+            src_up = UsdGeom.GetStageUpAxis(source_stage)
+            UsdGeom.SetStageUpAxis(overlay_stage, src_up)
+        except Exception:
+            src_up = UsdGeom.Tokens.y
         overlay_stage.GetRootLayer().subLayerPaths.append(str(Path(src_stage).resolve()))
 
         mesh_total = 0
@@ -142,7 +147,10 @@ def main() -> int:
         if not ground_prim.IsValid():
             plane = UsdGeom.Cube.Define(overlay_stage, Sdf.Path("/World/V34EGround"))
             plane.AddScaleOp().Set(Gf.Vec3f(100.0, 0.1, 100.0))
-            plane.AddTranslateOp().Set(Gf.Vec3f(0.0, -0.05, 0.0))
+            if str(src_up).upper().startswith("Z"):
+                plane.AddTranslateOp().Set(Gf.Vec3f(0.0, 0.0, -0.05))
+            else:
+                plane.AddTranslateOp().Set(Gf.Vec3f(0.0, -0.05, 0.0))
             pprim = plane.GetPrim()
             UsdPhysics.CollisionAPI.Apply(pprim)
             UsdPhysics.MeshCollisionAPI.Apply(pprim)
