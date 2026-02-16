@@ -121,6 +121,8 @@ python3 scripts/gpu/gpu_router.py --role isaac --output anchors | tee -a "${MAST
 
 # Depth fidelity gate (must pass before v33b A/B).
 (
+  export ISAAC_STEP_RENDER="${ISAAC_STEP_RENDER:-1}"
+  export ISAAC_STEP_RENDER_EVERY_N="${ISAAC_STEP_RENDER_EVERY_N:-1}"
   bash scripts/isaac/depth_fidelity_v33b4.sh
 ) 2>&1 | tee -a "${MASTER_LOG}"
 run_capture_motion "${ROOT_DIR}/runs/topo_mvp/v33b4_depth_fidelity/capture" "depth_fidelity"
@@ -128,6 +130,8 @@ run_capture_motion "${ROOT_DIR}/runs/topo_mvp/v33b4_depth_fidelity/capture" "dep
 # Baseline (same runtime config, v33b disabled)
 (
   export ISAAC_ENABLE_DEPTH="${ISAAC_ENABLE_DEPTH:-1}"
+  export ISAAC_STEP_RENDER="${ISAAC_STEP_RENDER:-1}"
+  export ISAAC_STEP_RENDER_EVERY_N="${ISAAC_STEP_RENDER_EVERY_N:-1}"
   export V33B_ENABLE=0
   export V33B_REQUIRE_DEPTH="${V33B_REQUIRE_DEPTH:-1}"
   export V33B_CLEARANCE_M="${V33B_CLEARANCE_M:-0.65}"
@@ -162,6 +166,8 @@ run_capture_motion "${BASELINE_CAPTURE_DIR}" "baseline_repr"
 # v33b enabled run (same runtime config)
 (
   export ISAAC_ENABLE_DEPTH="${ISAAC_ENABLE_DEPTH:-1}"
+  export ISAAC_STEP_RENDER="${ISAAC_STEP_RENDER:-1}"
+  export ISAAC_STEP_RENDER_EVERY_N="${ISAAC_STEP_RENDER_EVERY_N:-1}"
   export V33B_ENABLE=1
   export V33B_REQUIRE_DEPTH="${V33B_REQUIRE_DEPTH:-1}"
   export V33B_CLEARANCE_M="${V33B_CLEARANCE_M:-0.65}"

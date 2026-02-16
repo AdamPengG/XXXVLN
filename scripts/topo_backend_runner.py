@@ -878,11 +878,15 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                         depth_md5 = hashlib.md5(np.ascontiguousarray(d).tobytes()).hexdigest()
                         rgb_same = int(bool(v33b_rgb_hash_prev) and rgb_md5 == v33b_rgb_hash_prev)
                         depth_same = int(bool(v33b_depth_hash_prev) and depth_md5 == v33b_depth_hash_prev)
+                        sensor_rendered = int(obs.info.get("sensor_rendered", 1) if isinstance(obs.info, dict) else 1)
                         pose_moved = int(
                             (float(v33b_last_step_dpos) >= float(args.v33b_stale_dpos_eps))
                             or (abs(float(v33b_last_step_dyaw_deg)) >= float(args.v33b_stale_dyaw_eps))
                         )
-                        if rgb_same and depth_same:
+                        if sensor_rendered <= 0:
+                            v33b_pose_move_k = 0
+                            v33b_stationary_k = 0
+                        elif rgb_same and depth_same:
                             if pose_moved:
                                 v33b_pose_move_k += 1
                                 v33b_stationary_k = 0
@@ -897,7 +901,7 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                         v33b_depth_hash_repeat = int(v33b_pose_move_k)
                         print(
                             f"[V33B_STALE_CHECK] step={step} pose_moved={pose_moved} rgb_same={rgb_same} depth_same={depth_same} "
-                            f"stale_k={int(v33b_pose_move_k)} stationary_k={int(v33b_stationary_k)}",
+                            f"sensor_rendered={sensor_rendered} stale_k={int(v33b_pose_move_k)} stationary_k={int(v33b_stationary_k)}",
                             flush=True,
                         )
                         v33b_depth_hash_prev = depth_md5
@@ -911,6 +915,12 @@ def run_backend_navigation(args: argparse.Namespace) -> Dict[str, object]:
                             v33b_depth_unreliable = True
                             v33b_depth_stale_pose_moved = True
                             v33b_depth_disabled = True
+                            print(
+                                f"[ISAAC_SENSOR_STALE] step={step} dpos={float(v33b_last_step_dpos):.4f} "
+                                f"dyaw={float(v33b_last_step_dyaw_deg):.3f} rgb_same=1 depth_same=1 "
+                                f"K={int(v33b_pose_move_k)}",
+                                flush=True,
+                            )
                             print("[V33B_CAPS] depth=0 reason=depth_stale_pose_moved", flush=True)
                             if bool(args.v33b_require_depth):
                                 fail_reason = "backend_caps_depth_stale_pose_moved"

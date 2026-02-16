@@ -268,6 +268,7 @@ def _parse_v33b_log(log_path: Path) -> Dict[str, Any]:
         "depth_stale_pose_moved": 0,
         "robot_stationary": 0,
         "caps_depth_missing_key": 0,
+        "sensor_stale_events": 0,
     }
     reason_counts: Dict[str, int] = {}
     if not log_path.exists():
@@ -301,6 +302,8 @@ def _parse_v33b_log(log_path: Path) -> Dict[str, Any]:
             and "depth_same=1" in line
         ):
             out["robot_stationary"] += 1
+        if "[ISAAC_SENSOR_STALE]" in line:
+            out["sensor_stale_events"] += 1
     out["blocked_no_override_reasons"] = reason_counts
     return out
 
@@ -808,6 +811,9 @@ def main() -> int:
             depth_missing_key_flag = int(
                 result_v33b.get("depth_missing_key", v33b_stats.get("caps_depth_missing_key", 0)) or 0
             )
+            sensor_stale_events = int(
+                result_v33b.get("sensor_stale_events", v33b_stats.get("sensor_stale_events", 0)) or 0
+            )
 
             if goal_type == "room":
                 room_ok, room_metrics = is_room_success_from_trace(trace_rows, g)
@@ -909,6 +915,7 @@ def main() -> int:
                 "v33b_depth_stale_pose_moved": depth_stale_flag,
                 "v33b_robot_stationary_events": robot_stationary_events,
                 "v33b_depth_missing_key": depth_missing_key_flag,
+                "v33b_sensor_stale_events": sensor_stale_events,
                 "v33b_depth_key_used": depth_key_used,
                 "v33b_doorway_trigger_count": doorway_trigger_count,
                 "v33b_caps_depth0": int(v33b_stats.get("caps_depth0", 0)),
@@ -966,6 +973,7 @@ def main() -> int:
     v33b_depth_stale_runs = int(sum(1 for r in records if int(r.get("v33b_depth_stale_pose_moved", 0) or 0) > 0))
     v33b_robot_stationary_runs = int(sum(1 for r in records if int(r.get("v33b_robot_stationary_events", 0) or 0) > 0))
     v33b_depth_missing_key_runs = int(sum(1 for r in records if int(r.get("v33b_depth_missing_key", 0) or 0) > 0))
+    v33b_sensor_stale_total = int(sum(int(r.get("v33b_sensor_stale_events", 0) or 0) for r in records))
     v33b_depth_key_counter = Counter(str(r.get("v33b_depth_key_used", "") or "unset") for r in records)
     v33b_no_override_reasons = Counter()
     for r in records:
@@ -1022,6 +1030,7 @@ def main() -> int:
             "depth_stale_pose_moved_runs": v33b_depth_stale_runs,
             "robot_stationary_runs": v33b_robot_stationary_runs,
             "depth_missing_key_runs": v33b_depth_missing_key_runs,
+            "sensor_stale_events_total": v33b_sensor_stale_total,
             "depth_key_used": dict(sorted(v33b_depth_key_counter.items())),
         },
         "small_mode": int(bool(args.small)),
@@ -1063,6 +1072,7 @@ def main() -> int:
         f"doorway_triggers={v33b_doorway_total} depth_caps_missing_runs={v33b_depth_missing} "
         f"depth_stale_runs={v33b_depth_stale_runs} depth_stale_pose_moved_runs={v33b_depth_stale_runs} "
         f"robot_stationary_runs={v33b_robot_stationary_runs} depth_missing_key_runs={v33b_depth_missing_key_runs} "
+        f"sensor_stale_events_total={v33b_sensor_stale_total} "
         f"depth_key_used=\"{','.join(f'{k}:{v}' for k, v in sorted(v33b_depth_key_counter.items()))}\""
     )
     print(v33a_anchor, flush=True)
