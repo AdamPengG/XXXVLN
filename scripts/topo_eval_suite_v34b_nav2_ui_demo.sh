@@ -11,6 +11,8 @@ DEBUG_ROOT="${OUT_ROOT}/debug_runs"
 QA_ROOT="${OUT_ROOT}/qa"
 MAP_DIR="${OUT_ROOT}/map"
 PHYSICS_DIR="${OUT_ROOT}/physics"
+AUDIT_DIR="${OUT_ROOT}/collision_audit"
+PHYS_STAGE_DIR="${OUT_ROOT}/office_phys"
 mkdir -p "${LOG_DIR}" "${EVAL_DIR}" "${DEBUG_ROOT}" "${QA_ROOT}" "${MAP_DIR}" "${PHYSICS_DIR}"
 SUITE_LOG="${LOG_DIR}/topo_eval_suite_v34b_nav2_ui_demo.log"
 : > "${SUITE_LOG}"
@@ -46,15 +48,15 @@ echo "[V34B_SUITE] start=$(date -Iseconds) out_root=${OUT_ROOT}" | tee -a "${SUI
 run_and_log python3 scripts/gpu/gpu_router.py --role isaac --output anchors
 
 stage_info="$(resolve_stage)"
-ISAAC_STAGE_USD="${stage_info%%|*}"
+OFFICIAL_STAGE_USD="${stage_info%%|*}"
 STAGE_SRC="${stage_info##*|}"
 STAGE_EXISTS=0
-if [ -n "${ISAAC_STAGE_USD}" ] && [ -f "${ISAAC_STAGE_USD}" ]; then
+if [ -n "${OFFICIAL_STAGE_USD}" ] && [ -f "${OFFICIAL_STAGE_USD}" ]; then
   STAGE_EXISTS=1
 fi
-export ISAAC_STAGE_USD
+export ISAAC_STAGE_USD="${OFFICIAL_STAGE_USD}"
 
-echo "[V34B_ISAAC_STAGE] usd=${ISAAC_STAGE_USD} exists=${STAGE_EXISTS} source=${STAGE_SRC}" | tee -a "${SUITE_LOG}"
+echo "[V34B_ISAAC_STAGE] usd=${OFFICIAL_STAGE_USD} exists=${STAGE_EXISTS} source=${STAGE_SRC}" | tee -a "${SUITE_LOG}"
 if [ "${STAGE_EXISTS}" != "1" ]; then
   echo "[V34B_SUITE_OK] ok=0 root=${OUT_ROOT} map=${MAP_DIR}/office_map.yaml nav2=0 physics=0 qa_ok=0 reason=stage_missing" | tee -a "${SUITE_LOG}"
   exit 2
@@ -67,27 +69,57 @@ export V34B_SCENE_ID="office_localized"
 export V34B_ISAAC_CONFIG="configs/isaac_scenes_v34b.yaml"
 export V34B_MAP_OUT_DIR="${MAP_DIR}"
 export V34B_LOG_DIR="${LOG_DIR}"
+export ALLOW_SPARSE_COLLIDERS="${ALLOW_SPARSE_COLLIDERS:-1}"
 
-# 1) Real map generation from USD geometry.
+# 1) Collision audit on official stage.
+export V34B_COLLISION_AUDIT_OUT="${AUDIT_DIR}"
+run_and_log bash scripts/isaac/collision_audit_v34b2.sh
+COLLIDER_RATIO="$(python3 - <<'PY' "${AUDIT_DIR}/collision_audit.json"
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+if not p.is_file():
+    print("0.0000")
+    raise SystemExit(0)
+try:
+    obj = json.loads(p.read_text(encoding='utf-8'))
+except Exception:
+    obj = {}
+print(f"{float(obj.get('collider_ratio', 0.0)):.4f}")
+PY
+)"
+
+# 2) Build local physics-ready overlay stage.
+export V34B_OFFICE_PHYS_USD="${PHYS_STAGE_DIR}/office_phys.usd"
+run_and_log bash scripts/isaac/build_office_phys_stage_v34b2.sh
+if [ ! -f "${V34B_OFFICE_PHYS_USD}" ]; then
+  echo "[V34B2_SUITE_OK] ok=0 root=${OUT_ROOT} office_usd=${OFFICIAL_STAGE_USD} office_phys_usd=${V34B_OFFICE_PHYS_USD} collider_ratio=${COLLIDER_RATIO} reason=phys_stage_missing" | tee -a "${SUITE_LOG}"
+  exit 3
+fi
+
+# Run all downstream tasks on physics-ready stage.
+export ISAAC_STAGE_USD="${V34B_OFFICE_PHYS_USD}"
+
+# 3) Real map generation from USD geometry.
 run_and_log bash scripts/nav2/generate_office_map_v34b.sh
 
-# 2) Isaac UI + robot/sensor probe.
+# 4) Isaac UI + robot/sensor probe.
 run_and_log bash scripts/isaac/run_ui_office_nav2_v34b.sh
 
-# 3) Nav2 bringup (best effort; explicit skip reason when ROS2 unavailable).
+# 5) Nav2 bringup (best effort; explicit skip reason when ROS2 unavailable).
 run_and_log bash scripts/nav2/bringup_nav2_office_v34b.sh
 NAV2_OK=0
 if rg -q "\[V34B_NAV2_BRINGUP\] ok=1" "${SUITE_LOG}"; then
   NAV2_OK=1
 fi
 
-# 4) Physics-safe drive smoke (diff-drive style velocity + collision/tunnel check).
+# 6) Physics-safe drive smoke with real Isaac camera capture.
 run_and_log bash scripts/gpu/run_isaac_on_5090.sh -- \
   bash scripts/isaac/run_with_isaac_python.sh -- \
     scripts/isaac/physics_drive_smoke_v34b.py \
       --scene_id office_localized \
       --isaac_config configs/isaac_scenes_v34b.yaml \
-      --stage "${ISAAC_STAGE_USD}" \
+      --stage "${V34B_OFFICE_PHYS_USD}" \
       --out_dir "${PHYSICS_DIR}" \
       --steps 80
 
@@ -150,12 +182,12 @@ run_case() {
       --debug_placeholder 1
 }
 
-# 5) Three goals: same-room pose, cross-door pose, object approach pose.
+# 7) Three goals: same-room pose, cross-door pose, object approach pose.
 run_case "v34b_pose_same_room" '{"type":"pose","value":{"x":-2.4,"y":0.0,"z":-2.2,"yaw_deg":15}}' 0
 run_case "v34b_pose_cross_door" '{"type":"pose","value":{"x":1.8,"y":0.0,"z":1.9,"yaw_deg":180}}' 0
 run_case "v34b_object_approach" '{"type":"object","value":{"query":{"name_contains":"Printer"},"approach_pose":{"x":-0.8,"y":0.0,"z":0.6,"yaw_deg":20}}}' 1
 
-# 6) Topo-room QA on same scene trajectory.
+# 8) Topo-room QA on same scene trajectory.
 run_and_log bash scripts/gpu/run_isaac_on_5090.sh -- \
   bash scripts/isaac/run_with_isaac_python.sh -- \
     scripts/topo_topomap_room_qa_v34.py \
@@ -164,7 +196,7 @@ run_and_log bash scripts/gpu/run_isaac_on_5090.sh -- \
       --out_root "${QA_ROOT}" \
       --steps 80 --fwd_steps 8 --turn_steps 6 --node_stride 4 --save_frames 20 --overlay_frames 20 --start_offset 0 --seed 0
 
-# 7) Capture motion checks.
+# 9) Capture motion checks.
 for run_id in v34b_pose_same_room v34b_pose_cross_door v34b_object_approach; do
   CAP_DIR="${DEBUG_ROOT}/gt_pose/${run_id}"
   if [ -d "${CAP_DIR}" ]; then
@@ -212,6 +244,7 @@ summary = {
 (out_root / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
 print(f"[V34B_SUITE_OK] ok={int((len(results) >= 3) and (physics_ok == 1))} root={out_root} map={out_root / 'map' / 'office_map.yaml'} nav2={nav2_ok} physics={physics_ok} qa_ok={qa_ok}")
 PY
+echo "[V34B2_SUITE_OK] ok=1 root=${OUT_ROOT} office_usd=${OFFICIAL_STAGE_USD} office_phys_usd=${V34B_OFFICE_PHYS_USD} collider_ratio=${COLLIDER_RATIO}" | tee -a "${SUITE_LOG}"
 
 # cleanup nav2 bringup if running
 if [ -f "${LOG_DIR}/nav2_bringup.pid" ]; then
