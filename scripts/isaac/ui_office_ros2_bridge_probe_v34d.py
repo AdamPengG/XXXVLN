@@ -129,19 +129,16 @@ def _publish_ros(node: Any, x: float, z: float, yaw: float, dt: float) -> None:
 
     stamp = node.get_clock().now().to_msg()
 
-    # Publish static map->odom once, and odom->base_link each step.
-    t1 = TransformStamped()
-    t1.header.stamp = stamp
-    t1.header.frame_id = "map"
-    t1.child_frame_id = "odom"
-    t1.transform.rotation.w = 1.0
+    # Publish static base_link->base_scan once, and odom->base_link each step.
+    # map->odom is expected from localization (AMCL/SLAM), so we avoid publishing
+    # a conflicting static transform here.
     t3 = TransformStamped()
     t3.header.stamp = stamp
     t3.header.frame_id = "base_link"
     t3.child_frame_id = "base_scan"
     t3.transform.rotation.w = 1.0
     if not bool(getattr(node, "static_sent", False)):
-        node.tf_static_broadcaster.sendTransform([t1, t3])
+        node.tf_static_broadcaster.sendTransform([t3])
         node.static_sent = True
 
     t2 = TransformStamped()
@@ -196,6 +193,9 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=240)
     ap.add_argument("--ready_file", default="")
     ap.add_argument("--headless", default="1")
+    ap.add_argument("--idle_action", default=os.environ.get("V34D_IDLE_ACTION", "auto"))
+    ap.add_argument("--cmd_lin_thresh", type=float, default=float(os.environ.get("V34D_CMD_LIN_THRESH", "0.05")))
+    ap.add_argument("--cmd_ang_thresh", type=float, default=float(os.environ.get("V34D_CMD_ANG_THRESH", "0.05")))
     args = ap.parse_args()
 
     out_root = Path(args.out_dir)
@@ -257,6 +257,10 @@ def main() -> int:
         + ("" if ros_reason == "ok" else f" reason={ros_reason}"),
         flush=True,
     )
+    print(
+        f"[V34D_CMD_MAP] lin_thresh={float(args.cmd_lin_thresh):.3f} ang_thresh={float(args.cmd_ang_thresh):.3f} idle_action={str(args.idle_action)}",
+        flush=True,
+    )
 
     if args.ready_file:
         Path(args.ready_file).parent.mkdir(parents=True, exist_ok=True)
@@ -274,6 +278,7 @@ def main() -> int:
         )
 
     rgbs: List[np.ndarray] = []
+    depth_frames = 0
     moved = 0.0
     prev_pose = pose0
 
@@ -281,19 +286,22 @@ def main() -> int:
         action = 1
         if node is not None and (time.time() - float(node.last_cmd_t)) < 0.7:
             lin, ang = node.latest_cmd
-            if abs(ang) >= 0.30:
+            if abs(lin) >= float(args.cmd_lin_thresh):
+                action = 1 if lin > 0.0 else 0
+            elif abs(ang) >= float(args.cmd_ang_thresh):
                 action = 2 if ang > 0 else 3
-            elif lin <= 0.03:
+            else:
+                action = 0
+        else:
+            if str(args.idle_action).strip().lower() in ("stop", "hold", "idle"):
                 action = 0
             else:
-                action = 1
-        else:
-            if i % 24 in (20, 21):
-                action = 2
-            elif i % 24 in (22, 23):
-                action = 3
-            else:
-                action = 1
+                if i % 24 in (20, 21):
+                    action = 2
+                elif i % 24 in (22, 23):
+                    action = 3
+                else:
+                    action = 1
 
         obs, _, _ = backend.step(int(action))
         pose = backend.get_pose()
@@ -317,6 +325,22 @@ def main() -> int:
         )
         Image.fromarray(overlay).save(cap_dir / f"rgb_{i:03d}.png")
         rgbs.append(overlay)
+        if obs.depth is not None:
+            d = np.asarray(obs.depth, dtype=np.float32)
+            if d.ndim == 3:
+                d = d[..., 0]
+            if d.size > 0:
+                finite = np.isfinite(d) & (d > 0.0)
+                if np.any(finite):
+                    lo = float(np.percentile(d[finite], 5))
+                    hi = float(np.percentile(d[finite], 95))
+                    if hi > lo:
+                        norm = np.clip((d - lo) / (hi - lo), 0.0, 1.0)
+                    else:
+                        norm = np.zeros_like(d, dtype=np.float32)
+                    depth_u8 = (norm * 255.0).astype(np.uint8)
+                    Image.fromarray(depth_u8).save(cap_dir / f"depth_{i:03d}.png")
+                    depth_frames += 1
 
     gif_written = 0
     try:
@@ -343,6 +367,7 @@ def main() -> int:
                 "bridge_flags": flags,
                 "capture_dir": str(cap_dir),
                 "gif_written": int(gif_written),
+                "depth_frames": int(depth_frames),
                 "start_pose": {"x": float(pose0.x), "y": float(pose0.y), "z": float(pose0.z), "yaw_rad": float(pose0.yaw)},
                 "final_pose": {"x": float(pose_last.x), "y": float(pose_last.y), "z": float(pose_last.z), "yaw_rad": float(pose_last.yaw)},
             },

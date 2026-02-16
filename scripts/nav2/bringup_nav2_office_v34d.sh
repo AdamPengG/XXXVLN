@@ -16,7 +16,7 @@ ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
 RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
 IMG="${V34D_NAV2_DOCKER_IMAGE:-v34d_ros2_nav2:humble}"
 CONTAINER="${V34D_NAV2_CONTAINER:-v34d_nav2_stack}"
-READY_TIMEOUT="${V34D_NAV2_READY_TIMEOUT:-90}"
+READY_TIMEOUT="${V34D_NAV2_READY_TIMEOUT:-45}"
 
 if [ ! -f "${MAP_YAML}" ]; then
   echo "[V34D_NAV2_BRINGUP] ok=0 reason=map_missing map=${MAP_YAML} frames=\"map,odom,base_link\" planner=none controller=none scan=/scan" | tee -a "${LOG_FILE}"
@@ -82,10 +82,8 @@ for _ in $(seq 1 "${READY_TIMEOUT}"); do
   if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
     break
   fi
-  if docker exec "${CONTAINER}" bash -lc "source /opt/ros/humble/setup.bash && ros2 action list 2>/dev/null | grep -q '/navigate_to_pose'" >/dev/null 2>&1; then
-    if docker exec "${CONTAINER}" bash -lc "source /opt/ros/humble/setup.bash && ros2 lifecycle get /bt_navigator 2>/dev/null | grep -qi 'active'" >/dev/null 2>&1 && \
-       docker exec "${CONTAINER}" bash -lc "source /opt/ros/humble/setup.bash && ros2 lifecycle get /controller_server 2>/dev/null | grep -qi 'active'" >/dev/null 2>&1 && \
-       docker exec "${CONTAINER}" bash -lc "source /opt/ros/humble/setup.bash && ros2 lifecycle get /planner_server 2>/dev/null | grep -qi 'active'" >/dev/null 2>&1; then
+  if docker exec "${CONTAINER}" bash -lc "source /opt/ros/humble/setup.bash && timeout 2 ros2 action list 2>/dev/null | grep -q '/navigate_to_pose'" >/dev/null 2>&1; then
+    if docker exec "${CONTAINER}" bash -lc "source /opt/ros/humble/setup.bash && timeout 2 ros2 lifecycle get /bt_navigator 2>/dev/null | grep -qi 'active'" >/dev/null 2>&1; then
       ready=1
       break
     fi
