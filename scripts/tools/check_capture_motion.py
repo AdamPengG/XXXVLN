@@ -103,24 +103,33 @@ def _write_reports(root: Path, report: dict) -> None:
     (root / "motion_report.md").write_text("\n".join(md) + "\n", encoding="utf-8")
 
 
-def _try_gif(root: Path, rgbs: List[Path]) -> bool:
+def _try_gif(root: Path, rgbs: List[Path], min_frames: int = 20) -> int:
+    """Build GIF from RGB frames.  Returns frame count (0 = failed)."""
     if len(rgbs) == 0:
-        return False
+        return 0
     try:
         import imageio.v2 as imageio  # type: ignore
     except Exception:
-        return False
+        return 0
+    # Pick stride to hit >= min_frames if we have enough source
+    stride = max(1, len(rgbs) // max(min_frames, 1))
+    picked = rgbs[::stride]
     frames = []
-    for p in rgbs[:30]:
+    for p in picked:
         try:
-            frames.append(np.asarray(Image.open(p).convert("RGB"), dtype=np.uint8))
+            im = Image.open(p).convert("RGB")
+            w, h = im.size
+            if w > 480:
+                r = 480 / w
+                im = im.resize((480, int(h * r)), Image.LANCZOS)
+            frames.append(np.asarray(im, dtype=np.uint8))
         except Exception:
             continue
     if len(frames) < 2:
-        return False
+        return 0
     out = root / "rgb.gif"
-    imageio.mimsave(out, frames, duration=0.2)
-    return True
+    imageio.mimsave(out, frames, duration=0.15)
+    return len(frames)
 
 
 def main() -> int:
@@ -173,22 +182,31 @@ def main() -> int:
     }
     _write_reports(cap, report)
 
-    gif_written = False
-    if str(args.write_gif).strip() not in {"0", "false", "False"}:
-        gif_written = _try_gif(cap, rgb_files)
+    gif_frame_count = 0
+    want_gif = str(args.write_gif).strip() not in {"0", "false", "False"}
+    if want_gif:
+        gif_frame_count = _try_gif(cap, rgb_files, min_frames=20)
+    report["gif_frame_count"] = gif_frame_count
+    _write_reports(cap, report)
 
     degenerate = int(effective_changed_ratio < 0.01 and mean_rgb < 1.0)
+    # Hard gate: if gif was requested but has < 20 frames, fail
+    gif_fail = int(want_gif and gif_frame_count < 20)
     print(
         f"[CAPTURE_MOTION] frames={len(rgb_frames)} identical_pairs={identical_pairs} "
         f"mean_rgb_diff={mean_rgb:.6f} mean_depth_diff={mean_depth:.6f} "
         f"effective_changed_ratio={effective_changed_ratio:.6f} "
         f"degenerate={degenerate} "
+        f"gif_frame_count={gif_frame_count} "
         + ("" if degenerate == 0 else "reason=text_only_or_frozen ")
-        + f"gif={int(gif_written)} tag={args.tag}",
+        + ("" if gif_fail == 0 else f"gif_fail=1 gif_min=20 ")
+        + f"gif={int(gif_frame_count > 0)} tag={args.tag}",
         flush=True,
     )
     if degenerate == 1:
         return 3
+    if gif_fail == 1:
+        return 4
     return 0
 
 
