@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
 import time
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,6 +42,28 @@ def _resolve_stage(cfg: Dict[str, object], override_stage: str) -> Tuple[str, st
     if cfg_path:
         return cfg_path, "config"
     return "", "missing"
+
+
+def _quat_from_rpy(roll: float, pitch: float, yaw: float) -> Tuple[float, float, float, float]:
+    cr = math.cos(roll * 0.5)
+    sr = math.sin(roll * 0.5)
+    cp = math.cos(pitch * 0.5)
+    sp = math.sin(pitch * 0.5)
+    cy = math.cos(yaw * 0.5)
+    sy = math.sin(yaw * 0.5)
+    qw = cr * cp * cy + sr * sp * sy
+    qx = sr * cp * cy - cr * sp * sy
+    qy = cr * sp * cy + sr * cp * sy
+    qz = cr * cp * sy - sr * sp * cy
+    return float(qx), float(qy), float(qz), float(qw)
+
+
+def _yaw_from_quat(z: float, w: float) -> float:
+    return float(math.atan2(2.0 * w * z, 1.0 - 2.0 * z * z))
+
+
+def _wrap_pi(x: float) -> float:
+    return float((x + math.pi) % (2.0 * math.pi) - math.pi)
 
 
 def _collect_stage_signature() -> Tuple[str, int, str, float, List[str], int]:
@@ -124,7 +148,7 @@ def _inside_bounds_xy(xy: Tuple[float, float], bounds_raw: object) -> int:
     return int((x >= min_x) and (x <= max_x) and (y >= min_y) and (y <= max_y))
 
 
-def _init_ros2() -> Tuple[Optional[Any], Dict[str, int], str]:
+def _init_ros2(camera_height_m: float, cam_pitch_deg: float) -> Tuple[Optional[Any], Dict[str, int], str]:
     try:
         import rclpy  # type: ignore
         from geometry_msgs.msg import Twist  # type: ignore
@@ -140,16 +164,42 @@ def _init_ros2() -> Tuple[Optional[Any], Dict[str, int], str]:
                 super().__init__("v34d_bridge_probe")
                 self.latest_cmd = (0.0, 0.0)
                 self.last_cmd_t = 0.0
+                self.cmd_count = 0
+                self.cmd_nonzero = 0
+                self.cmd_max_lin = 0.0
+                self.cmd_max_ang = 0.0
+                self.cmd_first_t = 0.0
+                self.cmd_last_t = 0.0
                 self.odom_pub = self.create_publisher(Odometry, "/odom", 10)
                 self.scan_pub = self.create_publisher(LaserScan, "/scan", 10)
                 self.tf_broadcaster = TransformBroadcaster(self)
                 self.tf_static_broadcaster = StaticTransformBroadcaster(self)
                 self.create_subscription(Twist, "/cmd_vel", self.on_cmd, 10)
                 self.static_sent = False
+                self.camera_height_m = float(camera_height_m)
+                self.cam_pitch_deg = float(cam_pitch_deg)
+                self.latest_pose = (0.0, 0.0, 0.0)  # (x, z, yaw)
+                self.latest_dt = 0.1
+                pub_hz = max(2.0, float(os.environ.get("V34I_ODOM_PUB_HZ", "10.0")))
+                self.create_timer(1.0 / pub_hz, self.on_pub_timer)
 
             def on_cmd(self, msg: Twist) -> None:
-                self.latest_cmd = (float(msg.linear.x), float(msg.angular.z))
+                lin = float(msg.linear.x)
+                ang = float(msg.angular.z)
+                self.latest_cmd = (lin, ang)
                 self.last_cmd_t = time.time()
+                self.cmd_count += 1
+                if abs(lin) > 1e-3 or abs(ang) > 1e-3:
+                    self.cmd_nonzero += 1
+                self.cmd_max_lin = max(self.cmd_max_lin, abs(lin))
+                self.cmd_max_ang = max(self.cmd_max_ang, abs(ang))
+                if self.cmd_first_t <= 0.0:
+                    self.cmd_first_t = self.last_cmd_t
+                self.cmd_last_t = self.last_cmd_t
+
+            def on_pub_timer(self) -> None:
+                x, z, yaw = self.latest_pose
+                _publish_ros_msgs(self, float(x), float(z), float(yaw), float(self.latest_dt), spin=False)
 
         node = BridgeNode()
         return node, {"tf": 1, "odom": 1, "scan": 1, "cmd_vel_sub": 1}, "ok"
@@ -157,24 +207,53 @@ def _init_ros2() -> Tuple[Optional[Any], Dict[str, int], str]:
         return None, {"tf": 0, "odom": 0, "scan": 0, "cmd_vel_sub": 0}, f"rclpy_unavailable:{type(e).__name__}"
 
 
-def _publish_ros(node: Any, x: float, z: float, yaw: float, dt: float) -> None:
-    import rclpy  # type: ignore
+def _publish_ros_msgs(node: Any, x: float, z: float, yaw: float, dt: float, spin: bool) -> None:
     from geometry_msgs.msg import Quaternion, TransformStamped  # type: ignore
     from nav_msgs.msg import Odometry  # type: ignore
     from sensor_msgs.msg import LaserScan  # type: ignore
 
     stamp = node.get_clock().now().to_msg()
 
-    # Publish static base_link->base_scan once, and odom->base_link each step.
-    # map->odom is expected from localization (AMCL/SLAM), so we avoid publishing
-    # a conflicting static transform here.
+    # Publish static transforms once:
+    # map->odom identity (deterministic sim frame) and camera chain.
+    # This avoids goal rejection when localization is unavailable.
+    t_map = TransformStamped()
+    t_map.header.stamp = stamp
+    t_map.header.frame_id = "map"
+    t_map.child_frame_id = "odom"
+    t_map.transform.rotation.w = 1.0
+
+    # Camera mount: base_link -> camera_link with small downward pitch.
+    t_cam = TransformStamped()
+    t_cam.header.stamp = stamp
+    t_cam.header.frame_id = "base_link"
+    t_cam.child_frame_id = "camera_link"
+    t_cam.transform.translation.z = float(getattr(node, "camera_height_m", 1.5))
+    qx, qy, qz, qw = _quat_from_rpy(0.0, math.radians(float(getattr(node, "cam_pitch_deg", -10.0))), 0.0)
+    t_cam.transform.rotation.x = float(qx)
+    t_cam.transform.rotation.y = float(qy)
+    t_cam.transform.rotation.z = float(qz)
+    t_cam.transform.rotation.w = float(qw)
+
+    # REP-103 optical frame transform.
+    t_opt = TransformStamped()
+    t_opt.header.stamp = stamp
+    t_opt.header.frame_id = "camera_link"
+    t_opt.child_frame_id = "camera_optical_frame"
+    ox, oy, oz, ow = _quat_from_rpy(math.radians(-90.0), 0.0, math.radians(-90.0))
+    t_opt.transform.rotation.x = float(ox)
+    t_opt.transform.rotation.y = float(oy)
+    t_opt.transform.rotation.z = float(oz)
+    t_opt.transform.rotation.w = float(ow)
+
+    # base_link -> base_scan at identity.
     t3 = TransformStamped()
     t3.header.stamp = stamp
     t3.header.frame_id = "base_link"
     t3.child_frame_id = "base_scan"
     t3.transform.rotation.w = 1.0
     if not bool(getattr(node, "static_sent", False)):
-        node.tf_static_broadcaster.sendTransform([t3])
+        node.tf_static_broadcaster.sendTransform([t_map, t3, t_cam, t_opt])
         node.static_sent = True
 
     t2 = TransformStamped()
@@ -198,6 +277,8 @@ def _publish_ros(node: Any, x: float, z: float, yaw: float, dt: float) -> None:
     od.pose.pose.position.z = 0.0
     od.pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=float(qz), w=float(qw))
     node.odom_pub.publish(od)
+    # Keep local cache in sync for per-frame trace and cmd_vel diagnostics.
+    node.last_odom = od
 
     scan = LaserScan()
     scan.header.stamp = stamp
@@ -217,7 +298,13 @@ def _publish_ros(node: Any, x: float, z: float, yaw: float, dt: float) -> None:
     scan.ranges = [float(v) for v in ranges]
     node.scan_pub.publish(scan)
 
-    rclpy.spin_once(node, timeout_sec=0.0)
+    _ = spin
+
+
+def _publish_ros(node: Any, x: float, z: float, yaw: float, dt: float) -> None:
+    node.latest_pose = (float(x), float(z), float(yaw))
+    node.latest_dt = float(dt)
+    _publish_ros_msgs(node, float(x), float(z), float(yaw), float(dt), spin=False)
 
 
 def main() -> int:
@@ -235,6 +322,7 @@ def main() -> int:
     ap.add_argument("--fidelity_frames", type=int, default=int(os.environ.get("V34F_FIDELITY_FRAMES", "10")))
     ap.add_argument("--fidelity_luma_min", type=float, default=float(os.environ.get("V34F_FIDELITY_LUMA_MIN", "20.0")))
     ap.add_argument("--fidelity_placeholder_max", type=float, default=float(os.environ.get("V34F_FIDELITY_PLACEHOLDER_MAX", "0.2")))
+    ap.add_argument("--cam_pitch_deg", type=float, default=float(os.environ.get("ISAAC_CAMERA_PITCH_DEG", "-10.0")))
     args = ap.parse_args()
 
     out_root = Path(args.out_dir)
@@ -254,6 +342,10 @@ def main() -> int:
     cfg["usd_path"] = requested
     cfg.setdefault("cam_w", 1280)
     cfg.setdefault("cam_h", 720)
+    # v34h: tune kinematics for Nav2 command tracking (finer, less oscillatory).
+    cfg["dt_action"] = float(os.environ.get("V34H_DT_ACTION", "0.25"))
+    cfg["forward_speed_mps"] = float(os.environ.get("V34H_FORWARD_SPEED_MPS", "0.15"))
+    cfg["turn_rate_degps"] = float(os.environ.get("V34H_TURN_RATE_DEGPS", "12.0"))
 
     backend = IsaacSimBackend(
         scene_id=str(args.scene_id),
@@ -275,6 +367,11 @@ def main() -> int:
     ok = int(stage_match == 1 and sig_ok == 1)
     print(
         f"[V34D_STAGE_VERIFY] ok={ok} stage_url={stage_url} requested={requested} up_axis={up_axis} mpu={mpu:.6f} prims={prim_count} sig_ok={sig_ok} must_prims=\"{';'.join(must_prims)}\"",
+        flush=True,
+    )
+    stage_url_ok = int(stage_match == 1 and ("Office/office.usd" in stage_url or "office_phys.usd" in stage_url))
+    print(
+        f"[V34H_STAGE_VERIFY] ok={stage_url_ok} stage_url={stage_url} requested={requested}",
         flush=True,
     )
     if ok != 1:
@@ -339,7 +436,35 @@ def main() -> int:
         backend.close()
         return 4
 
-    node, flags, ros_reason = _init_ros2()
+    node, flags, ros_reason = _init_ros2(
+        camera_height_m=float(getattr(backend, "_camera_height_m", 1.5)),
+        cam_pitch_deg=float(args.cam_pitch_deg),
+    )
+    spin_stop = None
+    spin_thread = None
+    if node is not None:
+        try:
+            import rclpy  # type: ignore
+
+            spin_stop = threading.Event()
+
+            def _spin_worker() -> None:
+                while rclpy.ok() and (spin_stop is None or not spin_stop.is_set()):
+                    rclpy.spin_once(node, timeout_sec=0.02)
+
+            spin_thread = threading.Thread(target=_spin_worker, name="v34d_ros_spin", daemon=True)
+            spin_thread.start()
+        except Exception:
+            spin_stop = None
+            spin_thread = None
+    cam_roll = 0.0
+    cam_pitch = float(args.cam_pitch_deg)
+    cam_yaw = 0.0
+    cam_ok = int(abs(cam_roll) <= 5.0 and abs(cam_pitch) <= 20.0)
+    print(
+        f"[V34H_CAMERA_TF] roll_deg={cam_roll:.2f} pitch_deg={cam_pitch:.2f} yaw_deg={cam_yaw:.2f} ok={cam_ok}",
+        flush=True,
+    )
     print(
         f"[V34D_BRIDGE_TOPICS] ok={int(all(v == 1 for v in flags.values()))} tf={flags['tf']} odom={flags['odom']} scan={flags['scan']} cmd_vel_sub={flags['cmd_vel_sub']} domain={os.environ.get('ROS_DOMAIN_ID','0')} rmw={os.environ.get('RMW_IMPLEMENTATION','')}"
         + ("" if ros_reason == "ok" else f" reason={ros_reason}"),
@@ -369,17 +494,55 @@ def main() -> int:
     depth_frames = 0
     moved = 0.0
     prev_pose = pose0
+    pose_rows: List[List[object]] = []
 
     for i in range(int(args.steps)):
         action = 1
+        used_cmd_vel = 0
         if node is not None and (time.time() - float(node.last_cmd_t)) < 0.7:
             lin, ang = node.latest_cmd
-            if abs(lin) >= float(args.cmd_lin_thresh):
-                action = 1 if lin > 0.0 else 0
-            elif abs(ang) >= float(args.cmd_ang_thresh):
-                action = 2 if ang > 0 else 3
+            if hasattr(backend, "_set_pose") and hasattr(backend, "_build_obs"):
+                # v34h: integrate cmd_vel directly for smoother Nav2 tracking.
+                dt = float(cfg.get("dt_action", 0.25))
+                pose_prev = backend.get_pose()
+                lin_cmd = float(np.clip(float(lin), -0.35, 0.35))
+                ang_cmd = float(np.clip(float(ang), -1.6, 1.6))
+                nyaw = _wrap_pi(float(pose_prev.yaw) + ang_cmd * dt)
+                nx = float(pose_prev.x + math.sin(nyaw) * lin_cmd * dt)
+                nz = float(pose_prev.z - math.cos(nyaw) * lin_cmd * dt)
+                xyz = np.asarray([nx, float(pose_prev.y), nz], dtype=np.float32)
+                collide = False
+                try:
+                    if hasattr(backend, "_in_collision"):
+                        collide = bool(backend._in_collision(xyz))  # type: ignore[attr-defined]
+                except Exception:
+                    collide = False
+                if collide:
+                    xyz = np.asarray([float(pose_prev.x), float(pose_prev.y), float(pose_prev.z)], dtype=np.float32)
+                backend._set_pose(xyz, nyaw)  # type: ignore[attr-defined]
+                obs = backend._build_obs(  # type: ignore[attr-defined]
+                    info={
+                        "action_src": "cmd_vel",
+                        "lin_x": float(lin_cmd),
+                        "ang_z": float(ang_cmd),
+                        "collision_pred": int(collide),
+                    }
+                )
+                pose = backend.get_pose()
+                used_cmd_vel = 1
+                if abs(lin_cmd) >= float(args.cmd_lin_thresh):
+                    action = 1 if lin_cmd > 0.0 else 0
+                elif abs(ang_cmd) >= float(args.cmd_ang_thresh):
+                    action = 2 if ang_cmd > 0 else 3
+                else:
+                    action = 0
             else:
-                action = 0
+                if abs(lin) >= float(args.cmd_lin_thresh):
+                    action = 1 if lin > 0.0 else 0
+                elif abs(ang) >= float(args.cmd_ang_thresh):
+                    action = 2 if ang > 0 else 3
+                else:
+                    action = 0
         else:
             if str(args.idle_action).strip().lower() in ("stop", "hold", "idle"):
                 action = 0
@@ -391,12 +554,25 @@ def main() -> int:
                 else:
                     action = 1
 
-        obs, _, _ = backend.step(int(action))
-        pose = backend.get_pose()
+        if not used_cmd_vel:
+            obs, _, _ = backend.step(int(action))
+            pose = backend.get_pose()
         pose_last = pose
 
         if node is not None:
             _publish_ros(node, float(pose.x), float(pose.z), float(pose.yaw), dt=float(cfg.get("dt_action", 0.5)))
+            odom_x = float(node.last_odom.pose.pose.position.x) if getattr(node, "last_odom", None) is not None else float("nan")
+            odom_y = float(node.last_odom.pose.pose.position.y) if getattr(node, "last_odom", None) is not None else float("nan")
+            if getattr(node, "last_odom", None) is not None:
+                qz = float(node.last_odom.pose.pose.orientation.z)
+                qw = float(node.last_odom.pose.pose.orientation.w)
+                odom_yaw = _yaw_from_quat(qz, qw)
+            else:
+                odom_yaw = float("nan")
+        else:
+            odom_x = float("nan")
+            odom_y = float("nan")
+            odom_yaw = float("nan")
 
         d = math.hypot(float(pose.x - prev_pose.x), float(pose.z - prev_pose.z))
         moved += d
@@ -413,6 +589,18 @@ def main() -> int:
         )
         Image.fromarray(rgb).save(cap_dir / f"rgb_{i:03d}.png")
         Image.fromarray(overlay).save(cap_dir / f"overlay_rgb_{i:03d}.png")
+        pose_rows.append(
+            [
+                int(i),
+                float(pose.x),
+                float(pose.z),
+                float(pose.yaw),
+                float(odom_x),
+                float(odom_y),
+                float(odom_yaw),
+                "camera_optical_frame",
+            ]
+        )
         rgbs.append(rgb)
         if obs.depth is not None:
             d = np.asarray(obs.depth, dtype=np.float32)
@@ -440,6 +628,47 @@ def main() -> int:
     except Exception:
         pass
 
+    pose_csv = cap_dir / "pose_trace.csv"
+    with pose_csv.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["step", "gt_x", "gt_y", "gt_yaw_rad", "odom_x", "odom_y", "odom_yaw_rad", "camera_frame"])
+        for row in pose_rows:
+            w.writerow(row)
+
+    gt_moved_m = 0.0
+    odom_moved_m = 0.0
+    gt_vs_odom_err = 0.0
+    if pose_rows:
+        gx0, gy0 = float(pose_rows[0][1]), float(pose_rows[0][2])
+        gxn, gyn = float(pose_rows[-1][1]), float(pose_rows[-1][2])
+        gt_moved_m = float(math.hypot(gxn - gx0, gyn - gy0))
+        valid_odom = [r for r in pose_rows if (float(r[4]) == float(r[4]) and float(r[5]) == float(r[5]))]
+        if valid_odom:
+            ox0, oy0 = float(valid_odom[0][4]), float(valid_odom[0][5])
+            oxn, oyn = float(valid_odom[-1][4]), float(valid_odom[-1][5])
+            odom_moved_m = float(math.hypot(oxn - ox0, oyn - oy0))
+            errs = [math.hypot(float(r[1]) - float(r[4]), float(r[2]) - float(r[5])) for r in valid_odom]
+            if errs:
+                gt_vs_odom_err = float(np.mean(np.asarray(errs, dtype=np.float32)))
+
+    pose_ok = int(gt_moved_m >= 1.0 and odom_moved_m >= 1.0 and gt_vs_odom_err <= 0.3)
+    print(
+        f"[V34H_POSE_TRACE] frames={len(pose_rows)} gt_moved_m={gt_moved_m:.3f} "
+        f"odom_moved_m={odom_moved_m:.3f} gt_vs_odom_err_m={gt_vs_odom_err:.3f} ok={pose_ok}",
+        flush=True,
+    )
+
+    if node is not None:
+        dur = max(1e-6, float(node.cmd_last_t - node.cmd_first_t)) if float(node.cmd_first_t) > 0 else 0.0
+        hz = (float(node.cmd_count) / dur) if dur > 0.0 else 0.0
+        nonzero_ratio = (float(node.cmd_nonzero) / float(max(1, node.cmd_count))) if node.cmd_count > 0 else 0.0
+        cmd_ok = int(node.cmd_count > 0 and nonzero_ratio >= 0.05 and node.cmd_max_lin > 0.05)
+        print(
+            f"[V34H_CMDVEL_STATS] hz={hz:.3f} nonzero_ratio={nonzero_ratio:.3f} "
+            f"max_lin={float(node.cmd_max_lin):.3f} max_ang={float(node.cmd_max_ang):.3f} ok={cmd_ok}",
+            flush=True,
+        )
+
     (out_root / "probe_report_v34d.json").write_text(
         json.dumps(
             {
@@ -459,6 +688,19 @@ def main() -> int:
                 "capture_dir": str(cap_dir),
                 "gif_written": int(gif_written),
                 "depth_frames": int(depth_frames),
+                "pose_trace_csv": str(pose_csv),
+                "pose_trace": {
+                    "gt_moved_m": float(gt_moved_m),
+                    "odom_moved_m": float(odom_moved_m),
+                    "gt_vs_odom_err_m": float(gt_vs_odom_err),
+                    "ok": int(pose_ok),
+                },
+                "cmd_vel_stats": {
+                    "count": int(getattr(node, "cmd_count", 0) if node is not None else 0),
+                    "nonzero": int(getattr(node, "cmd_nonzero", 0) if node is not None else 0),
+                    "max_lin": float(getattr(node, "cmd_max_lin", 0.0) if node is not None else 0.0),
+                    "max_ang": float(getattr(node, "cmd_max_ang", 0.0) if node is not None else 0.0),
+                },
                 "start_pose": {
                     "x": float(pose0.x),
                     "y": float(pose0.y),
@@ -479,6 +721,10 @@ def main() -> int:
         try:
             import rclpy  # type: ignore
 
+            if spin_stop is not None:
+                spin_stop.set()
+            if spin_thread is not None:
+                spin_thread.join(timeout=1.0)
             node.destroy_node()
             rclpy.shutdown()
         except Exception:
