@@ -34,6 +34,7 @@ def main() -> int:
     ap.add_argument("--max_width", type=int, default=480, help="Resize to this width max")
     ap.add_argument("--duration_ms", type=int, default=150, help="Per-frame duration ms")
     ap.add_argument("--glob", default="rgb_*.png", help="Glob pattern for source PNGs")
+    ap.add_argument("--view", default="", help="View label for anchor (e.g. chase, fp)")
     args = ap.parse_args()
 
     cap = Path(args.capture_dir)
@@ -101,11 +102,17 @@ def main() -> int:
         optimize=True,
     )
     size_kb = out.stat().st_size / 1024
+    view_str = f" view={args.view}" if args.view else ""
     print(
         f"[GIF_FRAMES] ok=1 path={out} frames={len(frames)} stride={stride} "
-        f"size_kb={size_kb:.0f} max_width={args.max_width}",
+        f"size_kb={size_kb:.0f} max_width={args.max_width}{view_str}",
         flush=True,
     )
+    if args.view:
+        print(
+            f"[V35C_GIF] view={args.view} frames={len(frames)} stride={stride} path={out}",
+            flush=True,
+        )
     return 0
 
 
