@@ -82,6 +82,10 @@ class IsaacSimBackend(SimBackend):
         self._camera_probe_done = False
         self._stage_up_axis = "Y"
         self._camera_height_m = float(os.environ.get("ISAAC_CAMERA_HEIGHT_M", "1.5"))
+        self._camera_offset_m = self._parse_vec3_env("ISAAC_CAMERA_OFFSET", [0.20, 0.00, 0.30])
+        self._camera_rpy_deg = self._parse_vec3_env("ISAAC_CAMERA_RPY_DEG", [0.0, -10.0, 0.0])
+        self._camera_mount_logged = False
+        self._camera_mount_vec: Dict[str, object] = {}
         # v26: RGB capture forces world init + render
         if self._rgb_capture:
             self._minimal = False
@@ -234,6 +238,20 @@ class IsaacSimBackend(SimBackend):
                 continue
         return out
 
+    @staticmethod
+    def _parse_vec3_env(name: str, default_xyz: List[float]) -> np.ndarray:
+        raw = str(os.environ.get(name, "")).strip()
+        if not raw:
+            vals = list(default_xyz)
+        else:
+            try:
+                vals = [float(x.strip()) for x in raw.split(",")]
+            except Exception:
+                vals = list(default_xyz)
+        if len(vals) != 3:
+            vals = list(default_xyz)
+        return np.asarray([float(vals[0]), float(vals[1]), float(vals[2])], dtype=np.float32)
+
     @property
     def using_fallback_habitat(self) -> bool:
         return self._fallback is not None
@@ -381,39 +399,196 @@ class IsaacSimBackend(SimBackend):
             dtype=np.float32,
         )
 
+    @staticmethod
+    def _quat_from_rotmat(r: np.ndarray) -> np.ndarray:
+        # Return quaternion in wxyz.
+        m = np.asarray(r, dtype=np.float64)
+        tr = float(m[0, 0] + m[1, 1] + m[2, 2])
+        if tr > 0.0:
+            s = math.sqrt(tr + 1.0) * 2.0
+            qw = 0.25 * s
+            qx = (m[2, 1] - m[1, 2]) / s
+            qy = (m[0, 2] - m[2, 0]) / s
+            qz = (m[1, 0] - m[0, 1]) / s
+        elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+            s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+            qw = (m[2, 1] - m[1, 2]) / s
+            qx = 0.25 * s
+            qy = (m[0, 1] + m[1, 0]) / s
+            qz = (m[0, 2] + m[2, 0]) / s
+        elif m[1, 1] > m[2, 2]:
+            s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+            qw = (m[0, 2] - m[2, 0]) / s
+            qx = (m[0, 1] + m[1, 0]) / s
+            qy = 0.25 * s
+            qz = (m[1, 2] + m[2, 1]) / s
+        else:
+            s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+            qw = (m[1, 0] - m[0, 1]) / s
+            qx = (m[0, 2] + m[2, 0]) / s
+            qy = (m[1, 2] + m[2, 1]) / s
+            qz = 0.25 * s
+        q = np.asarray([qw, qx, qy, qz], dtype=np.float32)
+        n = float(np.linalg.norm(q))
+        if n <= 1e-8:
+            return np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        return (q / n).astype(np.float32)
+
+    @classmethod
+    def _quat_from_forward_up(cls, forward: np.ndarray, up: np.ndarray) -> np.ndarray:
+        f = np.asarray(forward, dtype=np.float64)
+        u = np.asarray(up, dtype=np.float64)
+        fn = float(np.linalg.norm(f))
+        un = float(np.linalg.norm(u))
+        if fn <= 1e-8 or un <= 1e-8:
+            return np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        f /= fn
+        u /= un
+        # Camera local axes: +Y is up, +Z is backward, so world z-axis column
+        # should be -forward.
+        right = np.cross(u, f)
+        rn = float(np.linalg.norm(right))
+        if rn <= 1e-8:
+            # fallback for near parallel vectors
+            right = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+            rn = 1.0
+        right /= rn
+        up_ortho = np.cross(f, right)
+        un2 = float(np.linalg.norm(up_ortho))
+        if un2 <= 1e-8:
+            up_ortho = u
+        else:
+            up_ortho /= un2
+        rot = np.stack([right, up_ortho, -f], axis=1)
+        return cls._quat_from_rotmat(rot)
+
+    @staticmethod
+    def _norm_vec(v: np.ndarray) -> np.ndarray:
+        vv = np.asarray(v, dtype=np.float32)
+        n = float(np.linalg.norm(vv))
+        if n <= 1e-8:
+            return np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+        return (vv / n).astype(np.float32)
+
+    @staticmethod
+    def _angle_deg(a: np.ndarray, b: np.ndarray) -> float:
+        aa = IsaacSimBackend._norm_vec(a)
+        bb = IsaacSimBackend._norm_vec(b)
+        dot = float(np.clip(np.dot(aa, bb), -1.0, 1.0))
+        return float(math.degrees(math.acos(dot)))
+
+    @staticmethod
+    def _rotmat_rpy_deg(rpy_deg: np.ndarray) -> np.ndarray:
+        roll = math.radians(float(rpy_deg[0]))
+        pitch = math.radians(float(rpy_deg[1]))
+        yaw = math.radians(float(rpy_deg[2]))
+        cx, sx = math.cos(roll), math.sin(roll)
+        cy, sy = math.cos(pitch), math.sin(pitch)
+        cz, sz = math.cos(yaw), math.sin(yaw)
+        rx = np.asarray([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float32)
+        ry = np.asarray([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float32)
+        rz = np.asarray([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        return np.matmul(np.matmul(rz, ry), rx)
+
+    def _axis_planar_label(self) -> str:
+        return "XY" if str(self._stage_up_axis).upper().startswith("Z") else "XZ"
+
+    def _compute_camera_mount(self) -> Dict[str, object]:
+        up_is_z = str(self._stage_up_axis).upper().startswith("Z")
+        if up_is_z:
+            world_up = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+            base_pos = np.asarray(
+                [float(self._pose_xyz[0]), float(self._pose_xyz[2]), float(self._pose_xyz[1])],
+                dtype=np.float32,
+            )
+            robot_forward = np.asarray([math.sin(self._yaw), -math.cos(self._yaw), 0.0], dtype=np.float32)
+            robot_right = np.asarray([math.cos(self._yaw), math.sin(self._yaw), 0.0], dtype=np.float32)
+        else:
+            world_up = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+            base_pos = np.asarray(
+                [float(self._pose_xyz[0]), float(self._pose_xyz[1]), float(self._pose_xyz[2])],
+                dtype=np.float32,
+            )
+            robot_forward = np.asarray([math.sin(self._yaw), 0.0, -math.cos(self._yaw)], dtype=np.float32)
+            robot_right = np.asarray([math.cos(self._yaw), 0.0, math.sin(self._yaw)], dtype=np.float32)
+
+        robot_forward = self._norm_vec(robot_forward)
+        robot_right = self._norm_vec(robot_right)
+        world_up = self._norm_vec(world_up)
+        rot_base = np.stack([robot_forward, robot_right, world_up], axis=1)
+        rot_off = self._rotmat_rpy_deg(self._camera_rpy_deg)
+        rot_cam = np.matmul(rot_base, rot_off)
+        cam_forward = self._norm_vec(rot_cam[:, 0])
+        cam_up = self._norm_vec(rot_cam[:, 2])
+
+        off = np.asarray(self._camera_offset_m, dtype=np.float32)
+        cam_pos = (
+            base_pos
+            + float(off[0]) * robot_forward
+            + float(off[1]) * robot_right
+            + float(off[2]) * world_up
+        )
+        quat_wxyz = self._quat_from_forward_up(forward=cam_forward, up=cam_up)
+        return {
+            "cam_pos": cam_pos.astype(np.float32),
+            "cam_quat_wxyz": quat_wxyz.astype(np.float32),
+            "cam_forward": cam_forward.astype(np.float32),
+            "cam_up": cam_up.astype(np.float32),
+            "robot_forward": robot_forward.astype(np.float32),
+            "world_up": world_up.astype(np.float32),
+            "angle_to_world_up_deg": float(self._angle_deg(cam_up, world_up)),
+            "angle_to_robot_fwd_deg": float(self._angle_deg(cam_forward, robot_forward)),
+        }
+
+    def set_camera_mount(
+        self,
+        offset_m: Optional[List[float]] = None,
+        rpy_deg: Optional[List[float]] = None,
+        emit_anchor: bool = False,
+    ) -> None:
+        if offset_m is not None and len(offset_m) == 3:
+            self._camera_offset_m = np.asarray(
+                [float(offset_m[0]), float(offset_m[1]), float(offset_m[2])], dtype=np.float32
+            )
+        if rpy_deg is not None and len(rpy_deg) == 3:
+            self._camera_rpy_deg = np.asarray(
+                [float(rpy_deg[0]), float(rpy_deg[1]), float(rpy_deg[2])], dtype=np.float32
+            )
+        # Re-apply current pose to refresh camera transform.
+        self._set_pose(self._pose_xyz.copy(), float(self._yaw))
+        if emit_anchor:
+            self._emit_camera_mount_anchors()
+
+    def _emit_camera_mount_anchors(self) -> None:
+        info = dict(self._camera_mount_vec or {})
+        if len(info) == 0:
+            info = self._compute_camera_mount()
+        cf = np.asarray(info.get("cam_forward", [0.0, 0.0, 0.0]), dtype=np.float32)
+        cu = np.asarray(info.get("cam_up", [0.0, 0.0, 0.0]), dtype=np.float32)
+        print(
+            f"[ISAAC_CAMERA_MOUNT] offset_m=({float(self._camera_offset_m[0]):.3f},{float(self._camera_offset_m[1]):.3f},{float(self._camera_offset_m[2]):.3f}) "
+            f"rpy_deg=({float(self._camera_rpy_deg[0]):.1f},{float(self._camera_rpy_deg[1]):.1f},{float(self._camera_rpy_deg[2]):.1f}) "
+            f"stage_up_axis={str(self._stage_up_axis).upper()} planar_axes={self._axis_planar_label()}",
+            flush=True,
+        )
+        print(
+            f"[ISAAC_CAMERA_VEC] cam_forward_world=({float(cf[0]):.4f},{float(cf[1]):.4f},{float(cf[2]):.4f}) "
+            f"cam_up_world=({float(cu[0]):.4f},{float(cu[1]):.4f},{float(cu[2]):.4f}) "
+            f"angle_to_world_up_deg={float(info.get('angle_to_world_up_deg', 180.0)):.2f} "
+            f"angle_to_robot_fwd_deg={float(info.get('angle_to_robot_fwd_deg', 180.0)):.2f}",
+            flush=True,
+        )
+        self._camera_mount_logged = True
+
     def _set_pose(self, xyz: np.ndarray, yaw: float) -> None:
         self._pose_xyz = np.asarray(xyz, dtype=np.float32)
         self._yaw = _wrap_pi(float(yaw))
+        mnt = self._compute_camera_mount()
+        self._camera_mount_vec = dict(mnt)
         if self._camera is None:
             return
-        if str(self._stage_up_axis).upper().startswith("Z"):
-            pos = np.array(
-                [
-                    float(self._pose_xyz[0]),
-                    float(self._pose_xyz[2]),
-                    float(self._camera_height_m),
-                ],
-                dtype=np.float32,
-            )
-            # USD camera looks along local -Z; for Z-up stages rotate camera so
-            # forward lies in XY plane, then apply yaw about world Z axis.
-            q_base = np.array(
-                [float(math.cos(-math.pi / 4.0)), float(math.sin(-math.pi / 4.0)), 0.0, 0.0],
-                dtype=np.float32,
-            )
-            q_yaw = np.array(
-                [float(math.cos(self._yaw / 2.0)), 0.0, 0.0, float(math.sin(self._yaw / 2.0))],
-                dtype=np.float32,
-            )
-            quat_wxyz = self._quat_mul(q_yaw, q_base)
-        else:
-            pos = np.array(
-                [float(self._pose_xyz[0]), float(self._camera_height_m), float(self._pose_xyz[2])],
-                dtype=np.float32,
-            )
-            qw = float(math.cos(self._yaw / 2.0))
-            qy = float(math.sin(self._yaw / 2.0))
-            quat_wxyz = np.array([qw, 0.0, qy, 0.0], dtype=np.float32)
+        pos = np.asarray(mnt["cam_pos"], dtype=np.float32)
+        quat_wxyz = np.asarray(mnt["cam_quat_wxyz"], dtype=np.float32)
         quat_xyzw = np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float32)
         try:
             self._camera.set_world_pose(position=pos, orientation=quat_wxyz)
@@ -692,6 +867,13 @@ class IsaacSimBackend(SimBackend):
         obs.info["sensor_rendered"] = int(sensor_rendered)
         obs.info["world_stepped"] = int(world_stepped)
         obs.info["step_render_every_n"] = int(self._step_render_every_n)
+        if len(self._camera_mount_vec) > 0:
+            obs.info["camera_mount"] = {
+                "offset_m": [float(v) for v in self._camera_offset_m.tolist()],
+                "rpy_deg": [float(v) for v in self._camera_rpy_deg.tolist()],
+                "angle_to_world_up_deg": float(self._camera_mount_vec.get("angle_to_world_up_deg", 0.0)),
+                "angle_to_robot_fwd_deg": float(self._camera_mount_vec.get("angle_to_robot_fwd_deg", 0.0)),
+            }
         if len(self._camera_cfg_info) > 0:
             obs.info["camera"] = dict(self._camera_cfg_info)
         if len(self._camera_fidelity_info) > 0:
@@ -785,6 +967,24 @@ class IsaacSimBackend(SimBackend):
         out["renderer_used"] = str(self._renderer_used)
         return out
 
+    def get_camera_mount_info(self) -> Dict[str, object]:
+        out: Dict[str, object] = {
+            "offset_m": [float(v) for v in self._camera_offset_m.tolist()],
+            "rpy_deg": [float(v) for v in self._camera_rpy_deg.tolist()],
+            "stage_up_axis": str(self._stage_up_axis).upper(),
+            "planar_axes": self._axis_planar_label(),
+        }
+        if len(self._camera_mount_vec) > 0:
+            out["cam_forward_world"] = [
+                float(v) for v in np.asarray(self._camera_mount_vec.get("cam_forward", [0.0, 0.0, 0.0]), dtype=np.float32)
+            ]
+            out["cam_up_world"] = [
+                float(v) for v in np.asarray(self._camera_mount_vec.get("cam_up", [0.0, 0.0, 0.0]), dtype=np.float32)
+            ]
+            out["angle_to_world_up_deg"] = float(self._camera_mount_vec.get("angle_to_world_up_deg", 0.0))
+            out["angle_to_robot_fwd_deg"] = float(self._camera_mount_vec.get("angle_to_robot_fwd_deg", 0.0))
+        return out
+
     def reset(self, scene_id: str, start_spec: Dict[str, object]) -> Obs:
         if self._fallback is not None:
             obs = self._fallback.reset(scene_id=scene_id, start_spec=start_spec)
@@ -792,6 +992,7 @@ class IsaacSimBackend(SimBackend):
             self._last_obs = obs
             return obs
 
+        self._camera_mount_logged = False
         starts = self.scene_cfg.get("starts", [])
         idx = int(start_spec.get("start_offset", 0))
         if isinstance(starts, list) and len(starts) > 0:
@@ -817,6 +1018,8 @@ class IsaacSimBackend(SimBackend):
         if not self._camera_probe_done and bool(int(os.environ.get("ISAAC_CAMERA_PROBE_ON_RESET", "1"))):
             self.run_camera_fidelity_probe(frames=int(os.environ.get("ISAAC_CAMERA_PROBE_FRAMES", "10")))
             self._camera_probe_done = True
+        if not self._camera_mount_logged:
+            self._emit_camera_mount_anchors()
         self._last_collision = False
         return self._build_obs(
             info={
