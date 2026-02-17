@@ -66,6 +66,12 @@ def _wrap_pi(x: float) -> float:
     return float((x + math.pi) % (2.0 * math.pi) - math.pi)
 
 
+def _backend_yaw_to_ros(yaw_backend: float) -> float:
+    # Backend yaw=0 points toward negative stage-Y in the Office setup.
+    # ROS convention expects yaw=0 toward +X. Apply a fixed -90deg offset.
+    return _wrap_pi(float(yaw_backend) - 0.5 * math.pi)
+
+
 def _collect_stage_signature() -> Tuple[str, int, str, float, List[str], int]:
     import omni.usd  # type: ignore
     from pxr import UsdGeom  # type: ignore
@@ -99,6 +105,40 @@ def _sky_ratio(rgb: np.ndarray) -> float:
     luma = 0.299 * r + 0.587 * g + 0.114 * b
     mask = (b > (r + 12.0)) & (b > (g + 8.0)) & (luma > 110.0)
     return float(np.mean(mask.astype(np.float32)))
+
+
+def _view_orientation_metrics(rgb: np.ndarray) -> Dict[str, float]:
+    arr = np.asarray(rgb, dtype=np.float32)
+    h, w = int(arr.shape[0]), int(arr.shape[1])
+    gray = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
+    gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
+    grad = np.sqrt(gx * gx + gy * gy)
+    top_n = max(1, int(round(0.30 * h)))
+    bot_n = max(1, int(round(0.30 * h)))
+    top_gray = gray[:top_n, :]
+    top_grad = grad[:top_n, :]
+    bot_gray = gray[h - bot_n :, :]
+    bot_grad = grad[h - bot_n :, :]
+    ceiling_like = (top_gray > 180.0) & (top_grad < 3.0)
+    # v34j: floor texture can be low-contrast in office renders. Use a softer
+    # gradient threshold to avoid false negatives when camera is correctly
+    # forward-facing.
+    floor_like = (bot_gray > 10.0) & (bot_gray < 245.0) & (bot_grad > 1.0)
+    return {
+        "mean_luma": float(np.mean(gray)),
+        "sky_ratio": float(_sky_ratio(rgb)),
+        "ceiling_like_ratio": float(np.mean(ceiling_like.astype(np.float32))),
+        "floor_like_ratio": float(np.mean(floor_like.astype(np.float32))),
+    }
+
+
+def _view_orientation_ok(metrics: Dict[str, float]) -> int:
+    ok = (
+        float(metrics.get("ceiling_like_ratio", 1.0)) <= 0.70
+        and float(metrics.get("floor_like_ratio", 0.0)) >= 0.05
+    )
+    return int(ok)
 
 
 def _draw_overlay(rgb: np.ndarray, text_lines: List[str]) -> np.ndarray:
@@ -256,6 +296,8 @@ def _publish_ros_msgs(node: Any, x: float, z: float, yaw: float, dt: float, spin
         node.tf_static_broadcaster.sendTransform([t_map, t3, t_cam, t_opt])
         node.static_sent = True
 
+    yaw_ros = _backend_yaw_to_ros(float(yaw))
+
     t2 = TransformStamped()
     t2.header.stamp = stamp
     t2.header.frame_id = "odom"
@@ -263,8 +305,8 @@ def _publish_ros_msgs(node: Any, x: float, z: float, yaw: float, dt: float, spin
     t2.transform.translation.x = float(x)
     t2.transform.translation.y = float(z)
     t2.transform.translation.z = 0.0
-    qz = math.sin(0.5 * yaw)
-    qw = math.cos(0.5 * yaw)
+    qz = math.sin(0.5 * yaw_ros)
+    qw = math.cos(0.5 * yaw_ros)
     t2.transform.rotation = Quaternion(x=0.0, y=0.0, z=float(qz), w=float(qw))
     node.tf_broadcaster.sendTransform(t2)
 
@@ -395,8 +437,8 @@ def main() -> int:
     )
 
     rgb0 = np.asarray(obs.rgb, dtype=np.uint8)
-    sky_ratio = _sky_ratio(rgb0)
-    mean_luma = float(np.mean(rgb0.astype(np.float32)))
+    view0 = _view_orientation_metrics(rgb0)
+    mean_luma = float(view0.get("mean_luma", 0.0))
 
     fidelity = backend.run_camera_fidelity_probe(frames=int(args.fidelity_frames))
     f_mean_luma = float(fidelity.get("mean_luma", mean_luma))
@@ -413,8 +455,68 @@ def main() -> int:
         + f"mean_luma={f_mean_luma:.3f} placeholder_ratio={f_placeholder:.3f}",
         flush=True,
     )
+    view_now = _view_orientation_metrics(np.asarray(obs.rgb, dtype=np.uint8))
+    orient_ok = _view_orientation_ok(view_now)
+    if orient_ok != 1:
+        # v34j: keep camera predominantly forward-facing in robot frame.
+        candidates = [
+            [0.0, -10.0, 0.0],
+            [0.0, -15.0, 0.0],
+            [0.0, -20.0, 0.0],
+            [0.0, -12.0, 15.0],
+        ]
+        best_idx = -1
+        best_score = -1e9
+        best_view: Dict[str, float] = dict(view_now)
+        for i, cand in enumerate(candidates):
+            try:
+                backend.set_camera_mount(rpy_deg=cand, emit_anchor=False)
+                obs_try, _, _ = backend.step(0)
+                rgb_try = np.asarray(obs_try.rgb, dtype=np.uint8)
+                m = _view_orientation_metrics(rgb_try)
+                mount = dict(backend.get_camera_mount_info())
+                angle_robot_fwd = float(mount.get("angle_to_robot_fwd_deg", 180.0))
+                orient_pass = int(_view_orientation_ok(m))
+                forward_pass = int(angle_robot_fwd <= 25.0)
+                score = (
+                    (100.0 if orient_pass == 1 else 0.0)
+                    + (50.0 if forward_pass == 1 else -50.0)
+                    + float(m["floor_like_ratio"])
+                    - float(m["ceiling_like_ratio"])
+                    - 0.5 * float(m["sky_ratio"])
+                    - 0.01 * angle_robot_fwd
+                )
+                if score > best_score:
+                    best_score = score
+                    best_idx = int(i)
+                    best_view = dict(m)
+            except Exception:
+                continue
+        if best_idx >= 0:
+            chosen = candidates[best_idx]
+            backend.set_camera_mount(rpy_deg=chosen, emit_anchor=True)
+            obs, _, _ = backend.step(0)
+            view_now = _view_orientation_metrics(np.asarray(obs.rgb, dtype=np.uint8))
+            orient_ok = _view_orientation_ok(view_now)
+            print(
+                f"[ISAAC_CAMERA_AUTOFIX] tried=4 chosen_idx={best_idx} chosen_rpy_deg=({float(chosen[0]):.1f},{float(chosen[1]):.1f},{float(chosen[2]):.1f}) metric={best_score:.4f}",
+                flush=True,
+            )
+        else:
+            print(
+                "[ISAAC_CAMERA_AUTOFIX] tried=4 chosen_idx=-1 chosen_rpy_deg=(nan,nan,nan) metric=-inf",
+                flush=True,
+            )
+            view_now = best_view
+            orient_ok = _view_orientation_ok(view_now)
     print(
-        f"[V34D_VIEW_CHECK] ok={fidelity_ok} mean_luma={f_mean_luma:.3f} sky_ratio={sky_ratio:.4f}",
+        f"[V34J_VIEW_ORIENT] mean_luma={float(view_now['mean_luma']):.3f} sky_ratio={float(view_now['sky_ratio']):.4f} "
+        f"ceiling_like_ratio={float(view_now['ceiling_like_ratio']):.4f} floor_like_ratio={float(view_now['floor_like_ratio']):.4f} ok={orient_ok}",
+        flush=True,
+    )
+    view_gate_ok = int(bool(fidelity_ok == 1 and orient_ok == 1))
+    print(
+        f"[V34D_VIEW_CHECK] ok={view_gate_ok} mean_luma={float(view_now['mean_luma']):.3f} sky_ratio={float(view_now['sky_ratio']):.4f}",
         flush=True,
     )
     mean_luma = f_mean_luma
@@ -427,14 +529,21 @@ def main() -> int:
                     "placeholder_max": float(args.fidelity_placeholder_max),
                 },
                 "fidelity": fidelity,
+                "view_orientation": dict(view_now),
             },
             indent=2,
         ),
         encoding="utf-8",
     )
-    if fidelity_ok != 1:
+    if fidelity_ok != 1 or orient_ok != 1:
         backend.close()
         return 4
+
+    cam_mount = {}
+    try:
+        cam_mount = dict(backend.get_camera_mount_info())
+    except Exception:
+        cam_mount = {}
 
     node, flags, ros_reason = _init_ros2(
         camera_height_m=float(getattr(backend, "_camera_height_m", 1.5)),
@@ -457,9 +566,15 @@ def main() -> int:
         except Exception:
             spin_stop = None
             spin_thread = None
-    cam_roll = 0.0
-    cam_pitch = float(args.cam_pitch_deg)
-    cam_yaw = 0.0
+    cam_roll, cam_pitch, cam_yaw = 0.0, float(args.cam_pitch_deg), 0.0
+    if len(cam_mount) > 0:
+        rpy = cam_mount.get("rpy_deg", [0.0, float(args.cam_pitch_deg), 0.0])
+        try:
+            cam_roll = float(rpy[0])
+            cam_pitch = float(rpy[1])
+            cam_yaw = float(rpy[2])
+        except Exception:
+            pass
     cam_ok = int(abs(cam_roll) <= 5.0 and abs(cam_pitch) <= 20.0)
     print(
         f"[V34H_CAMERA_TF] roll_deg={cam_roll:.2f} pitch_deg={cam_pitch:.2f} yaw_deg={cam_yaw:.2f} ok={cam_ok}",
@@ -474,6 +589,7 @@ def main() -> int:
         f"[V34D_CMD_MAP] lin_thresh={float(args.cmd_lin_thresh):.3f} ang_thresh={float(args.cmd_ang_thresh):.3f} idle_action={str(args.idle_action)}",
         flush=True,
     )
+    print("[V34J_FRAME_ALIGN] backend_yaw0_world=-Y ros_yaw_offset_deg=-90.0", flush=True)
 
     if args.ready_file:
         Path(args.ready_file).parent.mkdir(parents=True, exist_ok=True)
@@ -679,9 +795,10 @@ def main() -> int:
                 "mpu": mpu,
                 "prims": prim_count,
                 "must_prims": must_prims,
-                "sky_ratio": sky_ratio,
+                "sky_ratio": float(view_now.get("sky_ratio", 0.0)),
                 "mean_luma": mean_luma,
                 "camera_fidelity": fidelity,
+                "camera_mount": dict(cam_mount),
                 "moved_m": moved,
                 "frame": dict(frame_cfg),
                 "bridge_flags": flags,
